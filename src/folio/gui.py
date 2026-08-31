@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import queue
 import subprocess
+import sys
 import threading
 import tkinter as tk
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -17,22 +19,183 @@ from folio.output_catalog import SavedSite, list_saved_sites
 from folio.preview_server import PreviewServer
 
 
+@dataclass(frozen=True)
+class FolioTheme:
+    bg: str = "#f4ecdc"
+    panel: str = "#faf6ee"
+    fg: str = "#2c1f3a"
+    muted: str = "#6b5a7a"
+    header_bg: str = "#2a1847"
+    header_gold: str = "#e8c86a"
+    header_subtitle: str = "#c9b8df"
+    accent: str = "#c9a84c"
+    accent_active: str = "#dbbf6a"
+    accent_fg: str = "#2a1847"
+    border: str = "#d4c4a8"
+    log_bg: str = "#1e1429"
+    log_fg: str = "#e8dcc8"
+    status_bg: str = "#3d2463"
+    status_fg: str = "#f0e6d2"
+    title_font: tuple[str, int, str] = ("Palatino", 26, "bold")
+    subtitle_font: tuple[str, int] = ("Helvetica Neue", 12)
+    body_font: tuple[str, int] = ("Helvetica Neue", 13)
+    mono_font: tuple[str, int] = ("Menlo", 11)
+
+
+THEME = FolioTheme()
+
+
+def find_logo_path() -> Path | None:
+    """Return bundled logo path from the folio package assets."""
+    path = Path(__file__).resolve().parent / "assets" / "folio.png"
+    return path if path.is_file() else None
+
+
+def load_scaled_photo(path: Path, *, target_height: int) -> tk.PhotoImage:
+    """Load a PNG and downscale with subsampling for crisp Tk display."""
+    image = tk.PhotoImage(file=str(path))
+    factor = max(image.height() // target_height, 1)
+    if factor > 1:
+        return image.subsample(factor, factor)
+    return image
+
+
+def _tk_patchlevel_at_least(tk_root: tk.Misc, major: int, minor: int) -> bool:
+    patchlevel = str(tk_root.tk.call("info", "patchlevel"))
+    parts = patchlevel.split(".")
+    try:
+        return (int(parts[0]), int(parts[1])) >= (major, minor)
+    except (IndexError, ValueError):
+        return False
+
+
+def _has_touchpad_scroll(tk_root: tk.Misc) -> bool:
+    try:
+        tk_root.tk.call("info", "commands", "::tk::PreciseScrollDeltas")
+        return True
+    except tk.TclError:
+        return False
+
+
+def _mousewheel_steps(event: tk.Event, tk_root: tk.Misc) -> int:
+    if not event.delta:
+        return 0
+    if _tk_patchlevel_at_least(tk_root, 9, 0):
+        step = int(-event.delta / 120)
+        return step if step else (-1 if event.delta > 0 else 1)
+    if sys.platform == "darwin":
+        return -round(event.delta)
+    step = int(-event.delta / 120)
+    return step if step else (-1 if event.delta > 0 else 1)
+
+
+def _touchpad_vertical_step(event: tk.Event, tk_root: tk.Misc) -> int:
+    """Return vertical scroll step from a Tk 9 TouchpadScroll event."""
+    try:
+        delta_x, delta_y = tk_root.tk.call(
+            "::tk::PreciseScrollDeltas",
+            event.keycode,
+        )
+    except tk.TclError:
+        return 0
+    dx = int(delta_x)
+    dy = int(delta_y)
+    if dy == 0 or abs(dx) > abs(dy):
+        return 0
+    return dy
+
+
+def _widget_is_descendant(widget: tk.Misc, ancestor: tk.Misc) -> bool:
+    current: tk.Misc | None = widget
+    while current is not None:
+        if current == ancestor:
+            return True
+        current = current.master
+    return False
+
+
+def create_scrollable_frame(parent: ttk.Frame) -> tuple[tk.Canvas, ttk.Frame]:
+    """Return a vertical scroll canvas and inner frame that expands to content width."""
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=1)
+
+    canvas = tk.Canvas(
+        parent,
+        highlightthickness=0,
+        borderwidth=0,
+        bg=THEME.bg,
+    )
+    scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.grid(row=0, column=0, sticky=tk.NSEW)
+    scrollbar.grid(row=0, column=1, sticky=tk.NS)
+
+    scroll_frame = ttk.Frame(canvas, style="Main.TFrame")
+    window_id = canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
+
+    def _on_canvas_configure(event: tk.Event) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    def _on_frame_configure(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    canvas.bind("<Configure>", _on_canvas_configure)
+    scroll_frame.bind("<Configure>", _on_frame_configure)
+
+    return canvas, scroll_frame
+
+
+CAPTURE_PRESETS: dict[str, dict[str, int]] = {
+    "Fast": {
+        "image_wait_ms": 2_000,
+        "asset_quiet_ms": 500,
+        "page_asset_timeout_ms": 30_000,
+        "settle_ms": 500,
+        "timeout_secs": 45,
+    },
+    "Balanced": {
+        "image_wait_ms": 5_000,
+        "asset_quiet_ms": 750,
+        "page_asset_timeout_ms": 60_000,
+        "settle_ms": 1_000,
+        "timeout_secs": 60,
+    },
+    "Thorough": {
+        "image_wait_ms": 15_000,
+        "asset_quiet_ms": 1_500,
+        "page_asset_timeout_ms": 120_000,
+        "settle_ms": 2_000,
+        "timeout_secs": 90,
+    },
+}
+
+PAGE_CONCURRENCY_CHOICES = ("4", "8", "12", "20", "32")
+ASSET_CONCURRENCY_CHOICES = ("4", "8", "12", "20", "32")
+IMAGE_WAIT_CHOICES = ("0", "2000", "5000", "10000", "15000", "30000")
+ASSET_QUIET_CHOICES = ("0", "500", "750", "1000", "1500", "3000")
+PAGE_ASSET_CAP_CHOICES = ("30000", "60000", "90000", "120000")
+SETTLE_CHOICES = ("0", "500", "1000", "2000", "5000")
+TIMEOUT_CHOICES = ("30", "45", "60", "90", "120")
+FOLIO_SCROLL_TAG = "FolioScroll"
+
+
 class FolioApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Folio")
-        self.geometry("960x720")
-        self.minsize(820, 620)
+        self.geometry("920x760")
+        self.minsize(760, 640)
 
         self._output_dir = tk.StringVar(value=str(Path("output").resolve()))
         self._crawl_url = tk.StringVar(value="https://www.example.com/")
-        self._concurrency = tk.IntVar(value=20)
-        self._image_wait_ms = tk.IntVar(value=5000)
-        self._asset_quiet_ms = tk.IntVar(value=750)
-        self._page_asset_timeout_ms = tk.IntVar(value=60_000)
-        self._settle_ms = tk.IntVar(value=1000)
-        self._timeout_secs = tk.IntVar(value=60)
-        self._asset_concurrency = tk.IntVar(value=12)
+        self._capture_preset = tk.StringVar(value="Balanced")
+        self._concurrency = tk.StringVar(value="20")
+        self._asset_concurrency = tk.StringVar(value="12")
+        self._image_wait_ms = tk.StringVar(value="5000")
+        self._asset_quiet_ms = tk.StringVar(value="750")
+        self._page_asset_timeout_ms = tk.StringVar(value="60000")
+        self._settle_ms = tk.StringVar(value="1000")
+        self._timeout_secs = tk.StringVar(value="60")
         self._max_pages = tk.StringVar(value="")
         self._force = tk.BooleanVar(value=False)
 
@@ -41,98 +204,475 @@ class FolioApp(tk.Tk):
         self._crawl_thread: threading.Thread | None = None
         self._preview = PreviewServer(Path("output"))
         self._sites: list[SavedSite] = []
+        self._advanced_frame: ttk.LabelFrame | None = None
+        self._crawl_scroll_canvas: tk.Canvas | None = None
+        self._crawl_scroll_frame: ttk.Frame | None = None
+        self._crawl_scroll_outer: ttk.Frame | None = None
+        self._crawl_tab: ttk.Frame | None = None
+        self._library_tab: ttk.Frame | None = None
+        self._touchpad_bind_cmd: str | None = None
+        self._library_scroll_root: ttk.Frame | None = None
+        self._logo_photo: tk.PhotoImage | None = None
+        self._icon_photo: tk.PhotoImage | None = None
 
+        self._setup_theme()
+        self._setup_window_icon()
         self._build_ui()
+        self._setup_trackpad_scrolling()
         self._poll_log_queue()
         self.refresh_library()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _build_ui(self) -> None:
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    def _setup_theme(self) -> None:
+        self.configure(bg=THEME.bg)
+        style = ttk.Style(self)
+        style.theme_use("clam")
 
-        crawl_tab = ttk.Frame(notebook, padding=8)
-        library_tab = ttk.Frame(notebook, padding=8)
+        style.configure(".", background=THEME.bg, foreground=THEME.fg)
+        style.configure("Main.TFrame", background=THEME.bg)
+        style.configure("Card.TFrame", background=THEME.panel)
+        style.configure(
+            "TLabelframe",
+            background=THEME.panel,
+            foreground=THEME.fg,
+            bordercolor=THEME.border,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=THEME.panel,
+            foreground=THEME.muted,
+            font=("Helvetica Neue", 12, "bold"),
+        )
+        style.configure("TLabel", background=THEME.panel, foreground=THEME.fg)
+        style.configure(
+            "Hint.TLabel",
+            background=THEME.panel,
+            foreground=THEME.muted,
+            font=("Helvetica Neue", 11),
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground="#fffdf8",
+            foreground=THEME.fg,
+            bordercolor=THEME.border,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground="#fffdf8",
+            foreground=THEME.fg,
+            bordercolor=THEME.border,
+        )
+        style.configure(
+            "TNotebook",
+            background=THEME.bg,
+            bordercolor=THEME.border,
+            tabmargins=(2, 4, 2, 0),
+        )
+        tab_padding = (22, 10)
+        style.configure(
+            "TNotebook.Tab",
+            background=THEME.panel,
+            foreground=THEME.muted,
+            padding=tab_padding,
+            width=10,
+            font=("Helvetica Neue", 12, "bold"),
+            borderwidth=1,
+            focuscolor=THEME.panel,
+            lightcolor=THEME.border,
+            darkcolor=THEME.border,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", THEME.header_bg),
+                ("active", THEME.panel),
+                ("!selected", THEME.panel),
+            ],
+            foreground=[
+                ("selected", THEME.header_gold),
+                ("active", THEME.muted),
+                ("!selected", THEME.muted),
+            ],
+            padding=[
+                ("selected", tab_padding),
+                ("!selected", tab_padding),
+            ],
+            expand=[("selected", [0, 0, 0, 0]), ("!selected", [0, 0, 0, 0])],
+            lightcolor=[
+                ("selected", THEME.header_bg),
+                ("!selected", THEME.border),
+            ],
+            darkcolor=[
+                ("selected", THEME.header_bg),
+                ("!selected", THEME.border),
+            ],
+        )
+        style.configure(
+            "Treeview",
+            background="#fffdf8",
+            fieldbackground="#fffdf8",
+            foreground=THEME.fg,
+            bordercolor=THEME.border,
+            rowheight=28,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=THEME.header_bg,
+            foreground=THEME.header_gold,
+            font=("Helvetica Neue", 11, "bold"),
+        )
+        style.configure(
+            "TButton",
+            background=THEME.panel,
+            foreground=THEME.fg,
+            bordercolor=THEME.border,
+            padding=(12, 6),
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#efe5d3")],
+        )
+        style.configure(
+            "Accent.TButton",
+            background=THEME.accent,
+            foreground=THEME.accent_fg,
+            bordercolor=THEME.accent,
+            font=("Helvetica Neue", 12, "bold"),
+            padding=(16, 8),
+        )
+        style.map(
+            "Accent.TButton",
+            background=[
+                ("active", THEME.accent_active),
+                ("disabled", "#b9a888"),
+            ],
+            foreground=[("disabled", "#5c5348")],
+        )
+        style.configure(
+            "Danger.TButton",
+            background="#8b3a3a",
+            foreground="#fceeee",
+            bordercolor="#8b3a3a",
+            padding=(12, 6),
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#a44a4a"), ("disabled", "#b9a888")],
+        )
+
+    def _setup_window_icon(self) -> None:
+        logo_path = find_logo_path()
+        if logo_path is None:
+            return
+        self._icon_photo = load_scaled_photo(logo_path, target_height=64)
+        self.iconphoto(True, self._icon_photo)
+
+    def _widget_in_crawl_area(self, widget: tk.Misc) -> bool:
+        anchors: list[tk.Misc] = []
+        if self._crawl_scroll_canvas is not None:
+            anchors.append(self._crawl_scroll_canvas)
+        if self._crawl_scroll_frame is not None:
+            anchors.append(self._crawl_scroll_frame)
+        if self._crawl_scroll_outer is not None:
+            anchors.append(self._crawl_scroll_outer)
+        return any(_widget_is_descendant(widget, anchor) for anchor in anchors)
+
+    def _widget_in_library_area(self, widget: tk.Misc) -> bool:
+        if self._library_scroll_root is None:
+            return False
+        return _widget_is_descendant(widget, self._library_scroll_root)
+
+    def _install_scroll_tag(self, widget: tk.Misc) -> None:
+        """Run our scroll handler before Tk's default wheel/touchpad bindings."""
+        tags = widget.bindtags()
+        if FOLIO_SCROLL_TAG not in tags:
+            widget.bindtags((FOLIO_SCROLL_TAG, *tags))
+        for child in widget.winfo_children():
+            self._install_scroll_tag(child)
+
+    def _scroll_target_widget(self, event: tk.Event) -> tk.Misc:
+        px, py = self.winfo_pointerxy()
+        target = self.winfo_containing(px, py)
+        return target if target is not None else event.widget
+
+    def _scroll_crawl_by(self, step: int) -> str:
+        if step and self._crawl_scroll_canvas is not None:
+            self._crawl_scroll_canvas.yview_scroll(-step, "units")
+            return "break"
+        return ""
+
+    def _scroll_library_by(self, step: int) -> str:
+        if step:
+            self._site_tree.yview_scroll(-step, "units")
+            return "break"
+        return ""
+
+    def _route_mousewheel(self, event: tk.Event) -> str:
+        if event.num == 4:
+            step = 1
+        elif event.num == 5:
+            step = -1
+        else:
+            step = _mousewheel_steps(event, self)
+        if step == 0:
+            return ""
+        target = self._scroll_target_widget(event)
+        if self._widget_in_crawl_area(target):
+            return self._scroll_crawl_by(step)
+        if self._widget_in_library_area(target):
+            return self._scroll_library_by(step)
+        return ""
+
+    def _route_touchpad(self, event: tk.Event) -> str:
+        step = _touchpad_vertical_step(event, self)
+        if step == 0:
+            return ""
+        target = self._scroll_target_widget(event)
+        if self._widget_in_crawl_area(target):
+            return self._scroll_crawl_by(step)
+        if self._widget_in_library_area(target):
+            return self._scroll_library_by(step)
+        return ""
+
+    def _setup_trackpad_scrolling(self) -> None:
+        if self._crawl_scroll_canvas is None:
+            return
+
+        has_touchpad = _has_touchpad_scroll(self)
+        wheel_sequences = ["<MouseWheel>", "<Button-4>", "<Button-5>"]
+        if has_touchpad:
+            wheel_sequences.append("<TouchpadScroll>")
+
+        for sequence in wheel_sequences:
+            if sequence == "<TouchpadScroll>":
+                handler = self._route_touchpad
+            else:
+                handler = self._route_mousewheel
+            self.bind_class(FOLIO_SCROLL_TAG, sequence, handler, add="+")
+
+        for tab in (self._crawl_tab, self._library_tab):
+            if tab is not None:
+                self._install_scroll_tag(tab)
+
+        # Fallback: prepend a global TouchpadScroll handler (runs even without focus).
+        if has_touchpad:
+            self._touchpad_bind_cmd = self.register(self._route_touchpad)
+            self.tk.call(
+                "bind",
+                "all",
+                "<TouchpadScroll>",
+                f"+ {self._touchpad_bind_cmd}",
+            )
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(sequence, self._route_mousewheel, add="+")
+
+    def _build_header(self) -> None:
+        header = tk.Frame(self, bg=THEME.header_bg)
+        header.pack(fill=tk.X)
+        header.columnconfigure(1, weight=1)
+
+        logo_path = find_logo_path()
+        text_column = 0
+        if logo_path is not None:
+            self._logo_photo = load_scaled_photo(logo_path, target_height=72)
+            tk.Label(
+                header,
+                image=self._logo_photo,
+                bg=THEME.header_bg,
+                borderwidth=0,
+            ).grid(row=0, column=0, padx=(18, 10), pady=12, sticky=tk.NS)
+            text_column = 1
+
+        text_block = tk.Frame(header, bg=THEME.header_bg)
+        text_block.grid(row=0, column=text_column, sticky=tk.W, pady=12, padx=(0, 18))
+        tk.Label(
+            text_block,
+            text="Folio",
+            font=THEME.title_font,
+            fg=THEME.header_gold,
+            bg=THEME.header_bg,
+        ).pack(anchor=tk.W)
+        tk.Label(
+            text_block,
+            text="Save the web for offline reading",
+            font=THEME.subtitle_font,
+            fg=THEME.header_subtitle,
+            bg=THEME.header_bg,
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        accent = tk.Frame(self, bg=THEME.accent, height=3)
+        accent.pack(fill=tk.X)
+
+    def _build_ui(self) -> None:
+        self._build_header()
+
+        main = ttk.Frame(self, style="Main.TFrame", padding=(12, 10, 12, 0))
+        main.pack(fill=tk.BOTH, expand=True)
+
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        crawl_tab = ttk.Frame(notebook, padding=10, style="Main.TFrame")
+        library_tab = ttk.Frame(notebook, padding=10, style="Main.TFrame")
+        self._crawl_tab = crawl_tab
+        self._library_tab = library_tab
         notebook.add(crawl_tab, text="Crawl")
         notebook.add(library_tab, text="Library")
 
         self._build_crawl_tab(crawl_tab)
         self._build_library_tab(library_tab)
 
+        status_bar = tk.Frame(self, bg=THEME.status_bg, height=30)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        status_bar.pack_propagate(False)
         self._status = tk.StringVar(value="Ready")
-        ttk.Label(self, textvariable=self._status, anchor=tk.W).pack(
-            fill=tk.X,
-            padx=10,
-            pady=(0, 8),
-        )
+        tk.Label(
+            status_bar,
+            textvariable=self._status,
+            anchor=tk.W,
+            bg=THEME.status_bg,
+            fg=THEME.status_fg,
+            font=("Helvetica Neue", 11),
+            padx=14,
+        ).pack(fill=tk.BOTH, expand=True)
 
     def _build_crawl_tab(self, parent: ttk.Frame) -> None:
-        form = ttk.Frame(parent)
-        form.pack(fill=tk.X)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
 
-        self._add_labeled_entry(form, 0, "Start URL", self._crawl_url, width=70)
-        self._add_output_picker(form, 1)
+        scroll_outer = ttk.Frame(parent, style="Main.TFrame")
+        scroll_outer.grid(row=0, column=0, sticky=tk.NSEW)
+        self._crawl_scroll_outer = scroll_outer
+        self._crawl_scroll_canvas, body = create_scrollable_frame(scroll_outer)
+        self._crawl_scroll_frame = body
+        body.columnconfigure(0, weight=1)
 
-        options = ttk.LabelFrame(form, text="Options", padding=8)
-        options.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
-        for col in range(4):
-            options.columnconfigure(col, weight=1)
+        target = ttk.LabelFrame(body, text="Target", padding=8)
+        target.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        target.columnconfigure(1, weight=1)
+        self._add_labeled_entry(target, 0, "Start URL", self._crawl_url, width=60)
+        self._add_output_picker(target, 1)
 
-        self._add_spin(options, 0, 0, "Parallel pages", self._concurrency, 1, 64)
-        self._add_spin(
-            options, 0, 1, "Image wait (ms)", self._image_wait_ms, 0, 120_000
+        crawl = ttk.LabelFrame(body, text="Crawl", padding=8)
+        crawl.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
+        crawl.columnconfigure(1, weight=1)
+        self._add_combobox(
+            crawl,
+            0,
+            "Parallel pages",
+            self._concurrency,
+            PAGE_CONCURRENCY_CHOICES,
         )
-        self._add_spin(
-            options, 0, 2, "Asset quiet (ms)", self._asset_quiet_ms, 0, 10_000
+        self._add_combobox(
+            crawl,
+            1,
+            "Parallel assets",
+            self._asset_concurrency,
+            ASSET_CONCURRENCY_CHOICES,
         )
-        self._add_spin(options, 0, 3, "Settle (ms)", self._settle_ms, 0, 60_000)
-        self._add_spin(options, 1, 0, "Timeout (s)", self._timeout_secs, 10, 600)
-        self._add_spin(
-            options,
+        self._add_labeled_entry(crawl, 2, "Max pages", self._max_pages, width=12)
+        ttk.Checkbutton(
+            crawl,
+            text="Force re-fetch existing pages",
+            variable=self._force,
+        ).grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(4, 0),
+        )
+
+        capture = ttk.LabelFrame(body, text="Page capture", padding=8)
+        capture.grid(row=2, column=0, sticky=tk.EW, pady=(0, 8))
+        capture.columnconfigure(1, weight=1)
+        preset_values = (*CAPTURE_PRESETS.keys(), "Custom")
+        self._add_combobox(
+            capture,
+            0,
+            "Quality preset",
+            self._capture_preset,
+            preset_values,
+        )
+        self._capture_preset.trace_add("write", self._on_capture_preset_changed)
+        ttk.Label(
+            capture,
+            text="Fast skips waits; Thorough waits longer for images and downloads.",
+            wraplength=680,
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        self._advanced_frame = ttk.LabelFrame(body, text="Advanced timings", padding=8)
+        self._advanced_frame.grid(row=3, column=0, sticky=tk.EW, pady=(0, 8))
+        self._advanced_frame.columnconfigure(1, weight=1)
+        self._add_combobox(
+            self._advanced_frame,
+            0,
+            "Image wait (ms)",
+            self._image_wait_ms,
+            IMAGE_WAIT_CHOICES,
+        )
+        self._add_combobox(
+            self._advanced_frame,
             1,
-            1,
+            "Asset quiet (ms)",
+            self._asset_quiet_ms,
+            ASSET_QUIET_CHOICES,
+        )
+        self._add_combobox(
+            self._advanced_frame,
+            2,
             "Page asset cap (ms)",
             self._page_asset_timeout_ms,
-            1000,
-            300_000,
+            PAGE_ASSET_CAP_CHOICES,
         )
-        self._add_spin(
-            options,
-            1,
-            2,
-            "Asset parallel",
-            self._asset_concurrency,
-            1,
-            64,
+        self._add_combobox(
+            self._advanced_frame,
+            3,
+            "Settle (ms)",
+            self._settle_ms,
+            SETTLE_CHOICES,
         )
-        self._add_labeled_entry(
-            options,
-            1,
-            "Max pages",
-            self._max_pages,
-            width=10,
-            column=3,
+        self._add_combobox(
+            self._advanced_frame,
+            4,
+            "Page timeout (s)",
+            self._timeout_secs,
+            TIMEOUT_CHOICES,
         )
-        ttk.Checkbutton(options, text="Force re-fetch", variable=self._force).grid(
-            row=2,
-            column=0,
-            sticky=tk.W,
-            padx=4,
-            pady=4,
-        )
+        self._on_capture_preset_changed()
 
         exclude_frame = ttk.LabelFrame(
-            parent, text="Exclude path patterns (one per line)"
+            body,
+            text="Exclude paths (one pattern per line)",
+            padding=8,
         )
-        exclude_frame.pack(fill=tk.BOTH, expand=False, pady=(8, 0))
-        self._exclude_text = tk.Text(exclude_frame, height=4, wrap=tk.NONE)
-        self._exclude_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        exclude_frame.grid(row=4, column=0, sticky=tk.EW, pady=(0, 8))
+        exclude_frame.columnconfigure(0, weight=1)
+        self._exclude_text = tk.Text(
+            exclude_frame,
+            height=3,
+            wrap=tk.NONE,
+            bg="#fffdf8",
+            fg=THEME.fg,
+            insertbackground=THEME.accent,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=THEME.border,
+            highlightcolor=THEME.accent,
+            font=THEME.mono_font,
+        )
+        self._exclude_text.grid(row=0, column=0, sticky=tk.EW)
         self._exclude_text.insert("1.0", "/community/*\n/blog/*")
 
-        controls = ttk.Frame(parent)
-        controls.pack(fill=tk.X, pady=(8, 0))
+        controls = ttk.Frame(body)
+        controls.grid(row=5, column=0, sticky=tk.EW, pady=(0, 8))
         self._start_button = ttk.Button(
-            controls, text="Start crawl", command=self.start_crawl
+            controls,
+            text="Start crawl",
+            command=self.start_crawl,
+            style="Accent.TButton",
         )
         self._start_button.pack(side=tk.LEFT)
         self._continue_button = ttk.Button(
@@ -147,20 +687,33 @@ class FolioApp(tk.Tk):
             text="Stop",
             command=self.stop_crawl,
             state=tk.DISABLED,
+            style="Danger.TButton",
         )
         self._stop_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(parent, text="Log")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self._log = tk.Text(log_frame, height=16, wrap=tk.WORD, state=tk.DISABLED)
-        scroll = ttk.Scrollbar(log_frame, command=self._log.yview)
-        self._log.configure(yscrollcommand=scroll.set)
-        self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        log_frame = ttk.LabelFrame(body, text="Log", padding=8)
+        log_frame.grid(row=6, column=0, sticky=tk.EW, pady=(0, 8))
+        log_frame.columnconfigure(0, weight=1)
+        self._log = tk.Text(
+            log_frame,
+            height=14,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            bg=THEME.log_bg,
+            fg=THEME.log_fg,
+            insertbackground=THEME.header_gold,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            font=THEME.mono_font,
+        )
+        self._log.grid(row=0, column=0, sticky=tk.EW)
 
     def _build_library_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
         toolbar = ttk.Frame(parent)
-        toolbar.pack(fill=tk.X)
+        toolbar.grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(toolbar, text="Refresh", command=self.refresh_library).pack(
             side=tk.LEFT
         )
@@ -174,20 +727,30 @@ class FolioApp(tk.Tk):
             side=tk.RIGHT,
         )
 
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(8, 0))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self._library_scroll_root = tree_frame
+
         columns = ("host", "pages", "modified")
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         self._site_tree = ttk.Treeview(
-            parent,
+            tree_frame,
             columns=columns,
             show="headings",
             selectmode=tk.BROWSE,
+            yscrollcommand=tree_scroll.set,
         )
+        tree_scroll.configure(command=self._site_tree.yview)
         self._site_tree.heading("host", text="Site")
         self._site_tree.heading("pages", text="Pages")
         self._site_tree.heading("modified", text="Last saved")
         self._site_tree.column("host", width=360, anchor=tk.W)
         self._site_tree.column("pages", width=80, anchor=tk.E)
         self._site_tree.column("modified", width=180, anchor=tk.W)
-        self._site_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._site_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        tree_scroll.grid(row=0, column=1, sticky=tk.NS)
         self._site_tree.bind("<Double-1>", lambda _event: self.open_selected_site())
 
         hint = ttk.Label(
@@ -196,8 +759,9 @@ class FolioApp(tk.Tk):
                 "Double-click a site to open it in your browser "
                 "via a local preview server."
             ),
+            style="Hint.TLabel",
         )
-        hint.pack(anchor=tk.W, pady=(8, 0))
+        hint.grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
 
     def _add_labeled_entry(
         self,
@@ -209,55 +773,71 @@ class FolioApp(tk.Tk):
         width: int = 40,
         column: int = 0,
     ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=column, sticky=tk.W, pady=2)
+        ttk.Label(parent, text=label, style="Hint.TLabel").grid(
+            row=row, column=column, sticky=tk.W, pady=4, padx=(0, 8)
+        )
         ttk.Entry(parent, textvariable=variable, width=width).grid(
             row=row,
             column=column + 1,
             sticky=tk.EW,
-            padx=(8, 0),
-            pady=2,
+            pady=4,
         )
-        parent.columnconfigure(column + 1, weight=1)
+
+    def _add_combobox(
+        self,
+        parent: Any,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        values: tuple[str, ...],
+    ) -> ttk.Combobox:
+        ttk.Label(parent, text=label, style="Hint.TLabel").grid(
+            row=row, column=0, sticky=tk.W, pady=4, padx=(0, 8)
+        )
+        combo = ttk.Combobox(
+            parent,
+            textvariable=variable,
+            values=values,
+            state="readonly",
+            width=24,
+        )
+        combo.grid(row=row, column=1, sticky=tk.W, pady=4)
+        if variable.get() not in values:
+            variable.set(values[0])
+        return combo
 
     def _add_output_picker(self, parent: Any, row: int) -> None:
-        ttk.Label(parent, text="Output folder").grid(
-            row=row, column=0, sticky=tk.W, pady=2
+        ttk.Label(parent, text="Output folder", style="Hint.TLabel").grid(
+            row=row, column=0, sticky=tk.W, pady=4, padx=(0, 8)
         )
-        ttk.Entry(parent, textvariable=self._output_dir, width=70).grid(
-            row=row,
-            column=1,
-            sticky=tk.EW,
-            padx=(8, 0),
-            pady=2,
-        )
+        entry = ttk.Entry(parent, textvariable=self._output_dir)
+        entry.grid(row=row, column=1, sticky=tk.EW, pady=4)
         ttk.Button(parent, text="Browse…", command=self._pick_output_dir).grid(
             row=row,
             column=2,
             padx=(8, 0),
-            pady=2,
+            pady=4,
         )
-        parent.columnconfigure(1, weight=1)
 
-    def _add_spin(
-        self,
-        parent: Any,
-        row: int,
-        column: int,
-        label: str,
-        variable: tk.IntVar,
-        from_: int,
-        to: int,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(
-            row=row, column=column, sticky=tk.W, padx=4, pady=4
-        )
-        ttk.Spinbox(
-            parent,
-            from_=from_,
-            to=to,
-            textvariable=variable,
-            width=8,
-        ).grid(row=row + 1, column=column, sticky=tk.W, padx=4, pady=(0, 4))
+    def _on_capture_preset_changed(self, *_args: str) -> None:
+        preset = self._capture_preset.get()
+        if preset in CAPTURE_PRESETS:
+            values = CAPTURE_PRESETS[preset]
+            self._image_wait_ms.set(str(values["image_wait_ms"]))
+            self._asset_quiet_ms.set(str(values["asset_quiet_ms"]))
+            self._page_asset_timeout_ms.set(str(values["page_asset_timeout_ms"]))
+            self._settle_ms.set(str(values["settle_ms"]))
+            self._timeout_secs.set(str(values["timeout_secs"]))
+        if self._advanced_frame is not None:
+            if preset == "Custom":
+                self._advanced_frame.grid()
+            else:
+                self._advanced_frame.grid_remove()
+        if self._crawl_scroll_canvas is not None:
+            self._crawl_scroll_canvas.update_idletasks()
+            self._crawl_scroll_canvas.configure(
+                scrollregion=self._crawl_scroll_canvas.bbox("all"),
+            )
 
     def _pick_output_dir(self) -> None:
         chosen = filedialog.askdirectory(title="Choose Folio output folder")
@@ -287,19 +867,71 @@ class FolioApp(tk.Tk):
                 )
         self.after(100, self._poll_log_queue)
 
+    @staticmethod
+    def _parse_positive_int(raw: str, *, field: str) -> int | None:
+        cleaned = raw.strip()
+        if not cleaned:
+            messagebox.showerror("Invalid value", f"{field} is required.")
+            return None
+        try:
+            value = int(cleaned)
+        except ValueError:
+            messagebox.showerror("Invalid value", f"{field} must be a whole number.")
+            return None
+        if value < 0:
+            messagebox.showerror("Invalid value", f"{field} cannot be negative.")
+            return None
+        return value
+
     def _parse_settings(self) -> CrawlSettings | None:
         url = self._crawl_url.get().strip()
         if not url:
             messagebox.showerror("Missing URL", "Enter a start URL for the crawl.")
             return None
 
+        concurrency = self._parse_positive_int(
+            self._concurrency.get(),
+            field="Parallel pages",
+        )
+        asset_concurrency = self._parse_positive_int(
+            self._asset_concurrency.get(),
+            field="Parallel assets",
+        )
+        image_wait_ms = self._parse_positive_int(
+            self._image_wait_ms.get(),
+            field="Image wait",
+        )
+        asset_quiet_ms = self._parse_positive_int(
+            self._asset_quiet_ms.get(),
+            field="Asset quiet",
+        )
+        page_asset_timeout_ms = self._parse_positive_int(
+            self._page_asset_timeout_ms.get(),
+            field="Page asset cap",
+        )
+        settle_ms = self._parse_positive_int(self._settle_ms.get(), field="Settle")
+        timeout_secs = self._parse_positive_int(
+            self._timeout_secs.get(),
+            field="Page timeout",
+        )
+        if None in {
+            concurrency,
+            asset_concurrency,
+            image_wait_ms,
+            asset_quiet_ms,
+            page_asset_timeout_ms,
+            settle_ms,
+            timeout_secs,
+        }:
+            return None
+
         max_pages_raw = self._max_pages.get().strip()
         max_pages: int | None
         if max_pages_raw:
-            try:
-                max_pages = int(max_pages_raw)
-            except ValueError:
-                messagebox.showerror("Invalid max pages", "Max pages must be a number.")
+            max_pages = self._parse_positive_int(max_pages_raw, field="Max pages")
+            if max_pages is None or max_pages == 0:
+                if max_pages == 0:
+                    messagebox.showerror("Invalid max pages", "Max pages must be > 0.")
                 return None
         else:
             max_pages = None
@@ -312,13 +944,13 @@ class FolioApp(tk.Tk):
         return CrawlSettings(
             url=url,
             output_dir=Path(self._output_dir.get()).expanduser(),
-            concurrency=self._concurrency.get(),
-            image_wait_ms=self._image_wait_ms.get(),
-            asset_quiet_ms=self._asset_quiet_ms.get(),
-            page_asset_timeout_ms=self._page_asset_timeout_ms.get(),
-            settle_ms=self._settle_ms.get(),
-            timeout_secs=self._timeout_secs.get(),
-            asset_concurrency=self._asset_concurrency.get(),
+            concurrency=concurrency or 20,
+            image_wait_ms=image_wait_ms or 0,
+            asset_quiet_ms=asset_quiet_ms or 0,
+            page_asset_timeout_ms=page_asset_timeout_ms or 0,
+            settle_ms=settle_ms or 0,
+            timeout_secs=timeout_secs or 60,
+            asset_concurrency=asset_concurrency or 12,
             max_pages=max_pages,
             force=self._force.get(),
             exclude_patterns=excludes,
@@ -447,6 +1079,11 @@ class FolioApp(tk.Tk):
             self.stop_crawl()
         self._preview.stop()
         self.destroy()
+
+
+def apply_capture_preset(preset: str) -> dict[str, int]:
+    """Return timing values for a named capture preset."""
+    return dict(CAPTURE_PRESETS[preset])
 
 
 def run_gui() -> None:

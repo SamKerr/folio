@@ -1,181 +1,74 @@
 # Folio roadmap
 
-A plausible sprint plan for building Folio from zero to an offline-capable site copier.
+| Sprint | Goal | Tickets | Plan |
+|--------|------|---------|------|
+| **1** | Installable project with CLI and Playwright smoke test | T01–T03 | [sprint-1.md](sprints/plans/done/sprint-1.md) |
+| **2** | Login once, crawl same-domain pages to HTML | T04–T06 | [sprint-2.md](sprints/plans/done/sprint-2.md) |
+| **3** | Download and rewrite CSS, images, fonts for local paths | T07 | [sprint-3.md](sprints/plans/done/sprint-3.md) |
+| **4** | Lazy-load capture, script stripping, auth-free offline browse | T08–T09 | [sprint-4.md](sprints/plans/done/sprint-4.md) |
+| **5** | Desktop GUI: usable crawl settings, branding, and scrolling | T10 | [sprint-5.md](sprints/plans/done/sprint-5.md) |
 
 ---
 
-## Sprint 1 — Setup, tooling, and scaffolding
+## Sprint 1 — Setup tooling and scaffolding
 
-**Goal:** A installable Python project with dev tooling and a smoke test that proves Playwright works.
+**Goal:** `uv sync`, `folio doctor`, and the test/lint toolchain all work.
 
-### Scope
+- Python package under `src/folio/`
+- CLI: `folio --version`, `folio doctor`
+- pytest, ruff, mypy; README and AGENTS.md
 
-- Package layout (`src/folio/`, `pyproject.toml`, `uv` lockfile)
-- CLI entry point: `folio --version`, `folio --help`, `folio doctor`
-- `folio doctor` launches headless Chromium and confirms the stack works
-- Dev tooling: pytest, ruff, mypy
-- Docs: README setup steps, AGENTS.md project conventions
-- `.gitignore` for venv, output, caches
-
-### Tickets
-
-| Ticket | Summary |
-|--------|---------|
-| T01 | Project packaging and `uv sync` workflow |
-| T02 | CLI shell + Playwright doctor smoke test |
-| T03 | Test/lint config and developer docs |
-
-### Done criteria
-
-- `uv sync --group dev` succeeds
-- `uv run playwright install chromium` documented
-- `uv run folio doctor` passes
-- `uv run pytest` and `uv run ruff check .` pass
-
-### Out of scope
-
-- Crawling, link discovery, HTML persistence
-- CI (optional follow-up)
-- GUI or macOS app bundle
+**Done when:** Playwright/Chromium verified; no crawling yet.
 
 ---
 
-## Sprint 2 — Login, same-domain crawl, HTML snapshot
+## Sprint 2 — Interactive login and same-domain crawl
 
-**Goal:** Given a start URL, open a real browser, let the user log in, then crawl every same-host page and save rendered HTML to disk.
+**Goal:** `folio crawl <url>` opens a browser for login, then saves same-host pages as HTML.
 
-### Scope
+- Headed Chromium; user confirms login with Enter
+- BFS link discovery; output under `output/<host>/`
+- Resume, excludes, parallelism, rate limiting
 
-- `folio crawl <url>` opens **headed** Chromium on the target
-- User logs in manually, confirms with **Enter** in the terminal (`--skip-login-wait` for automation)
-- BFS crawl via `<a href>` discovery; stay on **same hostname** as the root URL
-- Map URLs to `output/<host>/path/to/page.html`
-- `--max-pages`, `--delay`, `--exclude` path globs, `--force` re-fetch
-- Resume: skip pages whose HTML file already exists
-- Parallel page workers (default 20 tabs)
-- Unit tests with mocked Playwright (no live network in CI)
-
-### Target verification
-
-```bash
-uv run folio crawl https://www.example.com/
-# Log in in the browser, press Enter, crawl runs to output/
-```
-
-### Tickets
-
-| Ticket | Summary |
-|--------|---------|
-| T04 | URL normalization, same-host checks, output path mapping |
-| T05 | Crawler engine: login pause, queue, visited set, HTML save |
-| T06 | `crawl` CLI flags, README, output directory conventions |
-
-### Done criteria
-
-- After login, same-domain pages appear under `output/www.example.com/`
-- Crawl is resumable and respects excludes
-- Tests pass without hitting the live site
-
-### Out of scope
-
-- Downloading CSS/JS/images (HTML only at this stage)
-- Automated credential storage
-- `robots.txt` enforcement
+**Done when:** Same-domain pages persist as HTML after a manual login.
 
 ---
 
-## Sprint 3 — Offline fidelity (look, feel, and no re-login)
+## Sprint 3 — Offline asset mirroring
 
-**Goal:** Saved pages look like the live site when browsed locally. CSS, fonts, images, and layout match; scripts stripped or neutralized so pages do not redirect back to login.
+**Goal:** Saved pages pull in styling assets and link to local copies.
 
-### Scope
+- Download CSS, images, fonts (including CDN)
+- Rewrite HTML/CSS URLs; rewrite same-host navigation links
+- Assets under `output/_assets/`
 
-#### Asset capture and rewrite
-
-- Download static assets the browser loads: CSS, fonts, images, SVGs
-- Store under `output/_assets/<host>/…`
-- Rewrite HTML/CSS URLs (including `srcset`, lazy `data-src`, inline `style`, `<use href>` sprites)
-- Rewrite same-host `<a href>` to relative local HTML paths
-- Cross-origin CDN assets downloaded; crawl queue stays same-host only
-
-#### Page preparation before snapshot
-
-- Scroll pages to trigger lazy-loaded content
-- Expand collapsed sections (chevron icons only — not arbitrary buttons)
-- Wait for `<img>` elements and network-quiet period for CSS/font/image traffic
-- Wait for lazy **Excalidraw** diagram placeholders to be replaced with inline SVG
-
-#### Offline safety
-
-- Strip executable scripts from saved HTML
-- Remove video/audio sources
-- Offline copy browsable via local static server without auth
-
-#### Developer UX
-
-- `folio gui` — desktop UI for crawl config, live log, and saved-site library
-- `scripts/build-macos-app.sh` → double-clickable **Folio.app**
-- Tunable waits: `--asset-quiet-ms`, `--diagram-wait-ms`, `--image-wait-ms`, `--settle-ms`
-
-### Tickets
-
-| Ticket | Summary |
-|--------|---------|
-| T07 | Asset mirror: download, cache, rewrite HTML/CSS links |
-| T08 | Page capture: scroll, chevron expand, image/diagram/network waits |
-| T09 | Offline sanitization and login redirect guard |
-
-### Done criteria
-
-- Saved pages render with styling, diagrams, and fonts offline
-- No login redirect when opening saved pages from `output/`
-- `uv run folio gui` and built `Folio.app` launch the crawler
-- Full test suite passes
-
-### Verification
-
-```bash
-uv run folio crawl https://www.example.com/learn/system-design \
-  --output output \
-  --force
-
-# Preview (recommended over file://)
-cd output && python -m http.server 8765
-# Open http://127.0.0.1:8765/www.example.com/…
-```
-
-### Out of scope
-
-- Perfect parity for authenticated-only or WebSocket-driven features
-- Crawling outside the root hostname
-- Bundled Chromium inside the `.app` (app uses project venv + Playwright install)
+**Done when:** Offline pages render with basic styling via a static server.
 
 ---
 
-## How the sprints build on each other
+## Sprint 4 — Full offline fidelity
 
-```mermaid
-flowchart LR
-  S1[Sprint 1\nTooling + doctor]
-  S2[Sprint 2\nLogin + HTML crawl]
-  S3[Sprint 3\nAssets + offline UX]
-  S1 --> S2 --> S3
-```
+**Goal:** Offline copy matches the live site visually; no re-login when browsing locally.
 
-| Sprint | You can… |
-|--------|----------|
-| 1 | Install, run tests, confirm Playwright |
-| 2 | Log in once, save same-domain HTML pages |
-| 3 | Browse a local copy that looks like the live site |
+- Scroll and wait for lazy images and diagrams before capture
+- Network + DOM asset discovery; richer HTML/CSS rewrite
+- Strip scripts and media hooks so pages stay static offline
+
+**Done when:** CSS, images, and fonts survive offline; no auth redirect on saved pages.
 
 ---
 
-## Optional follow-ups (post–Sprint 3)
+## Sprint 5 — Desktop GUI polish
 
-Not required for the core offline snapshot workflow, but natural next steps:
+**Goal:** A usable, branded desktop UI for configuring crawls and browsing saved output.
 
-- CI workflow (pytest/ruff/mypy on push)
-- `robots.txt` / crawl politeness defaults
-- Incremental sync (only re-fetch changed pages/assets)
-- Standalone `.app` with embedded Python + Chromium (no project folder dependency)
-- Search index across saved pages
+- Reorganize crawl settings into clear groups: Target, Crawl, Page capture, Excludes
+- Replace clipped macOS spinboxes with dropdowns; capture presets (Fast / Balanced / Thorough / Custom)
+- Branded header and window icon from `folio.png`; purple, gold, and parchment theme
+- One scrollable Crawl page (options, controls, and log together); trackpad scrolling on macOS
+- Library tab with scrollable site list; tab bar keeps fixed size and changes colour only
+
+**Done when:** `uv run folio gui` is readable at default window size, every control maps to the correct CLI flags, and the app feels intentionally designed rather than a debug form.
+
+---
+

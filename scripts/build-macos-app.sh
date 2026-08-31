@@ -21,7 +21,15 @@ sed "s|@FOLIO_VERSION@|$VERSION|g" "$ROOT/scripts/macos/Info.plist" > "$APP/Cont
 if [[ -f "$ROOT/scripts/macos/Folio.icns" ]]; then
 	cp "$ROOT/scripts/macos/Folio.icns" "$RESOURCES/Folio.icns"
 else
-	/usr/bin/sips -s format png -z 512 512 /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns --out "$RESOURCES/icon.png" >/dev/null 2>&1 || true
+	ICON_SOURCE=""
+	if [[ -f "$ROOT/src/folio/assets/folio.png" ]]; then
+		ICON_SOURCE="$ROOT/src/folio/assets/folio.png"
+	else
+		/usr/bin/sips -s format png -z 512 512 /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns --out "$RESOURCES/icon.png" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$ICON_SOURCE" ]]; then
+		sips -s format png -z 512 512 "$ICON_SOURCE" --out "$RESOURCES/icon.png" >/dev/null
+	fi
 	if [[ -f "$RESOURCES/icon.png" ]]; then
 		mkdir -p "$RESOURCES/Folio.iconset"
 		for size in 16 32 128 256 512; do

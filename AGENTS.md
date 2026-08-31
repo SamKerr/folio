@@ -101,7 +101,7 @@ Run this before ending a sprint session or marking work complete:
 
 ## Safety
 
-- Keep docs/scripts updated when commands or behavior change
+- Keep docs/scripts updated when commands or behaviour change
 - Never commit secrets or `.env` values
 - Never edit user-owned draft docs (e.g. personal roadmaps) unless explicitly asked
 - Crawl only sites you are allowed to access; rate-limit requests when implementing the crawler
