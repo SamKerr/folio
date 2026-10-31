@@ -56,6 +56,20 @@ uv run folio crawl https://www.example.com/ \
   --force
 ```
 
+Crawl a **subset** of a site, e.g. one search and the listings it links to, politely:
+
+```bash
+uv run folio crawl "https://www.example.com/search?area=leeds" \
+  --include "/search*" --include "/listing/*" \
+  --keep-query --concurrency 2 --delay 2 --headless --skip-login-wait
+```
+
+- `--include PATTERN` (repeatable): only follow matching URLs; the start URL(s) are always
+  crawled. Several start URLs on the same host can be given.
+- `--keep-query`: pages that differ only by query string (page 2, filters) get their own
+  file, `<name>.q<hash>.html`, instead of overwriting each other. Rewritten links carry
+  `data-folio-url` so a resumed crawl follows the exact URLs again.
+
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
 ## Caveats

@@ -231,9 +231,11 @@ class AssetMirror:
         *,
         assets_dirname: str = "_assets",
         concurrency: int = 12,
+        keep_query: bool = False,
     ) -> None:
         self._request = request
         self._output_dir = output_dir
+        self._keep_query = keep_query
         self._assets_root = output_dir / assets_dirname
         self._cache: dict[str, Path] = {}
         self._in_progress: set[str] = set()
@@ -518,8 +520,11 @@ class AssetMirror:
             return
         if not same_host(absolute, root_url):
             return
-        local_page = url_to_output_path(absolute, self._output_dir)
+        local_page = url_to_output_path(
+            absolute, self._output_dir, keep_query=self._keep_query
+        )
         anchor["href"] = relative_uri(html_path, local_page)
+        anchor["data-folio-url"] = absolute  # exact URL for resume (query included)
 
 
 def _should_mirror_link(tag: Tag) -> bool:

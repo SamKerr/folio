@@ -93,3 +93,34 @@ def test_crawl_failure(capsys: CaptureFixture[str]) -> None:
 
     captured = capsys.readouterr()
     assert "Crawl failed" in captured.err
+
+
+def test_crawl_passes_include_keep_query_and_extra_urls(
+    capsys: CaptureFixture[str],
+) -> None:
+    from folio.crawler import CrawlResult
+
+    result = CrawlResult("https://a.com/x", 2, 0, Path("output"))
+    with patch(
+        "folio.cli.run_crawl", new_callable=AsyncMock, return_value=result
+    ) as mock_crawl:
+        code = main(
+            [
+                "crawl",
+                "https://a.com/x",
+                "https://a.com/y",
+                "--include",
+                "/p/*",
+                "--keep-query",
+                "--headless",
+                "--skip-login-wait",
+            ]
+        )
+    assert code == 0
+    assert mock_crawl.await_args is not None
+    args, kwargs = mock_crawl.await_args
+    assert args[0] == "https://a.com/x"
+    assert kwargs["extra_start_urls"] == ("https://a.com/y",)
+    assert kwargs["include_patterns"] == ("/p/*",)
+    assert kwargs["keep_query"] is True
+    assert "saved 2 new page(s)" in capsys.readouterr().out

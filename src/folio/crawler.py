@@ -22,6 +22,7 @@ from folio.capture import (
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
 from folio.urls import (
     is_excluded_url,
+    is_included_url,
     normalize_url,
     output_path_to_url,
     same_host,
@@ -61,6 +62,7 @@ def extract_links_from_saved_html(
     output_dir: Path,
     root_url: str,
     exclude_patterns: tuple[str, ...] = (),
+    include_patterns: tuple[str, ...] = (),
 ) -> list[str]:
     """Discover crawl URLs from an already-saved offline HTML file."""
     soup = BeautifulSoup(html, "html.parser")
@@ -69,6 +71,9 @@ def extract_links_from_saved_html(
         href = anchor.get("href")
         if not isinstance(href, str) or href.startswith("#"):
             continue
+        original = anchor.get("data-folio-url")
+        if isinstance(original, str) and original:
+            href = original  # written by the asset mirror; keeps the query string
         try:
             if href.startswith(("http://", "https://")):
                 normalized = normalize_url(href)
@@ -82,8 +87,10 @@ def extract_links_from_saved_html(
                 continue
         except ValueError:
             continue
-        if same_host(normalized, root_url) and not is_excluded_url(
-            normalized, exclude_patterns
+        if (
+            same_host(normalized, root_url)
+            and not is_excluded_url(normalized, exclude_patterns)
+            and is_included_url(normalized, include_patterns)
         ):
             discovered.append(normalized)
     return discovered
@@ -109,13 +116,28 @@ async def run_crawl(
     navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
     resume: bool = True,
     exclude_patterns: tuple[str, ...] = (),
+    include_patterns: tuple[str, ...] = (),
+    keep_query: bool = False,
+    extra_start_urls: tuple[str, ...] = (),
     verbose: bool = True,
 ) -> CrawlResult:
-    """Open start_url, wait for optional login confirmation, then crawl."""
+    """Open start_url, wait for optional login confirmation, then crawl.
+
+    ``include_patterns`` restrict the crawl to matching URLs (start URLs always
+    allowed); ``keep_query`` gives query-string URLs their own files;
+    ``extra_start_urls`` are additional same-host seeds.
+    """
     root_url = normalize_url(start_url)
     if is_excluded_url(root_url, exclude_patterns):
         msg = f"Start URL is excluded by pattern: {root_url}"
         raise ValueError(msg)
+    seeds: list[str] = []
+    for extra in extra_start_urls:
+        normalized = normalize_url(extra)
+        if not same_host(normalized, root_url):
+            msg = f"Extra start URL is on another host: {extra}"
+            raise ValueError(msg)
+        seeds.append(normalized)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as playwright:
@@ -140,6 +162,9 @@ async def run_crawl(
                 navigation_timeout_ms=navigation_timeout_ms,
                 resume=resume,
                 exclude_patterns=exclude_patterns,
+                include_patterns=include_patterns,
+                keep_query=keep_query,
+                extra_start_urls=tuple(seeds),
                 verbose=verbose,
             )
         finally:
@@ -173,6 +198,9 @@ async def _crawl_with_browser(
     navigation_timeout_ms: int,
     resume: bool,
     exclude_patterns: tuple[str, ...],
+    include_patterns: tuple[str, ...] = (),
+    keep_query: bool = False,
+    extra_start_urls: tuple[str, ...] = (),
     verbose: bool,
 ) -> tuple[int, int]:
     context = await browser.new_context()
@@ -182,6 +210,7 @@ async def _crawl_with_browser(
         context.request,
         output_dir,
         concurrency=asset_concurrency,
+        keep_query=keep_query,
     )
 
     login_page = await context.new_page()
@@ -217,6 +246,9 @@ async def _crawl_with_browser(
             delay_seconds=delay_seconds,
             resume=resume,
             exclude_patterns=exclude_patterns,
+            include_patterns=include_patterns,
+            keep_query=keep_query,
+            extra_start_urls=extra_start_urls,
             verbose=verbose,
         )
     finally:
@@ -241,6 +273,9 @@ async def _crawl_pages_parallel(
     delay_seconds: float,
     resume: bool,
     exclude_patterns: tuple[str, ...],
+    include_patterns: tuple[str, ...] = (),
+    keep_query: bool = False,
+    extra_start_urls: tuple[str, ...] = (),
     verbose: bool,
 ) -> tuple[int, int]:
     queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
@@ -249,9 +284,11 @@ async def _crawl_pages_parallel(
     enqueue_counter = 0
     enqueue_lock = asyncio.Lock()
 
-    async def enqueue_url(url: str) -> None:
+    async def enqueue_url(url: str, *, seed: bool = False) -> None:
         nonlocal enqueue_counter
         if is_excluded_url(url, exclude_patterns):
+            return
+        if not seed and not is_included_url(url, include_patterns):
             return
         section = url_path_section(url)
         async with section_lock:
@@ -264,7 +301,9 @@ async def _crawl_pages_parallel(
             order = enqueue_counter
         await queue.put((section_rank, depth, order, url))
 
-    await enqueue_url(root_url)
+    await enqueue_url(root_url, seed=True)
+    for seed_url in extra_start_urls:
+        await enqueue_url(seed_url, seed=True)
 
     visited: set[str] = set()
     visited_lock = asyncio.Lock()
@@ -323,7 +362,9 @@ async def _crawl_pages_parallel(
                                 continue
                         visited.add(url)
 
-                    out_path = url_to_output_path(url, output_dir)
+                    out_path = url_to_output_path(
+                        url, output_dir, keep_query=keep_query
+                    )
                     discovered: list[str] | None
                     if resume and out_path.is_file():
                         if verbose:
@@ -339,6 +380,7 @@ async def _crawl_pages_parallel(
                             output_dir=output_dir,
                             root_url=root_url,
                             exclude_patterns=exclude_patterns,
+                            include_patterns=include_patterns,
                         )
                         async with pages_lock:
                             pages_skipped += 1
@@ -366,6 +408,8 @@ async def _crawl_pages_parallel(
                             click_delay_ms=click_delay_ms,
                             navigation_timeout_ms=navigation_timeout_ms,
                             exclude_patterns=exclude_patterns,
+                            include_patterns=include_patterns,
+                            keep_query=keep_query,
                             asset_tracker=asset_tracker,
                         )
                         if discovered is None:
@@ -420,6 +464,8 @@ async def _save_page(
     navigation_timeout_ms: int,
     exclude_patterns: tuple[str, ...],
     asset_tracker: AssetQuietTracker,
+    include_patterns: tuple[str, ...] = (),
+    keep_query: bool = False,
 ) -> list[str] | None:
     """Fetch one page and return same-host links discovered on it."""
     if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
@@ -440,7 +486,7 @@ async def _save_page(
         skip_interact=True,
         asset_tracker=asset_tracker,
     )
-    out_path = url_to_output_path(url, output_dir)
+    out_path = url_to_output_path(url, output_dir, keep_query=keep_query)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     network_urls = set(capture.urls)
     try:
@@ -468,8 +514,10 @@ async def _save_page(
             normalized = normalize_url(link, base=url)
         except ValueError:
             continue
-        if same_host(normalized, root_url) and not is_excluded_url(
-            normalized, exclude_patterns
+        if (
+            same_host(normalized, root_url)
+            and not is_excluded_url(normalized, exclude_patterns)
+            and is_included_url(normalized, include_patterns)
         ):
             discovered.append(normalized)
     return discovered

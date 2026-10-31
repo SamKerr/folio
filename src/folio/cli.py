@@ -37,7 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl_parser.add_argument(
         "url",
-        help="Starting URL (e.g. https://www.example.com/)",
+        nargs="+",
+        help="Starting URL(s) on one host (e.g. https://www.example.com/)",
     )
     crawl_parser.add_argument(
         "--output",
@@ -126,6 +127,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip URLs matching path glob (repeatable), e.g. /community/*",
     )
     crawl_parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Only follow URLs matching path glob (repeatable), e.g. /properties/*; "
+            "start URLs are always crawled"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--keep-query",
+        action="store_true",
+        help=(
+            "Save URLs with a query string to their own file (<name>.q<hash>.html) "
+            "instead of collapsing them onto the path"
+        ),
+    )
+    crawl_parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser headless (not recommended when login is required)",
@@ -168,8 +187,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = asyncio.run(
                 run_crawl(
-                    args.url,
+                    args.url[0],
                     args.output,
+                    extra_start_urls=tuple(args.url[1:]),
+                    include_patterns=tuple(args.include),
+                    keep_query=args.keep_query,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,
