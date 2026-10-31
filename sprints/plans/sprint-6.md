@@ -6,6 +6,7 @@
 - `--keep-query`: query-string URLs get their own output file; rewritten anchors record the
   exact URL (`data-folio-url`) so resume follows them
 - Several start URLs on one host (positional `url` takes many)
+- `--data-sidecar`: keep JSON scripts, write `<page>.data.json` with the page's embedded data
 - Tests, README; CLI only (the GUI keeps its current options)
 
 ## Out of scope
@@ -16,6 +17,7 @@
 ## Tickets
 
 - [x] `T11-include-keep-query-seeds`
+- [x] `T12-data-sidecar`
 
 ## Done criteria
 

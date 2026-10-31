@@ -70,6 +70,11 @@ uv run folio crawl "https://www.example.com/search?area=leeds" \
   file, `<name>.q<hash>.html`, instead of overwriting each other. Rewritten links carry
   `data-folio-url` so a resumed crawl follows the exact URLs again.
 
+- `--data-sidecar`: keep non-executable JSON scripts (e.g. schema.org JSON-LD) in the snapshot
+  and write each page's embedded data — JSON scripts and inline data scripts such as
+  `window.PAGE_MODEL = {...}` — to `<page>.data.json`, so another program can parse the
+  listing data offline while the HTML stays script-free.
+
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
 ## Caveats

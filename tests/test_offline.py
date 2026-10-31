@@ -1,4 +1,4 @@
-from folio.offline import prepare_static_snapshot
+from folio.offline import extract_data_scripts, prepare_static_snapshot
 
 
 def test_prepare_static_snapshot_removes_all_scripts() -> None:
@@ -51,3 +51,32 @@ def test_prepare_static_snapshot_removes_js_preload_links() -> None:
     assert "modulepreload" not in result
     assert 'as="script"' not in result
     assert 'as="font"' in result
+
+
+_DATA_PAGE = (
+    """
+<html><head>
+<script type="application/ld+json">{"@type": "Residence", "name": "x"}</script>
+<script src="/app.js"></script>
+<script>window.PAGE_MODEL = {"propertyData": {"id": 1, "price": 100000}};"""
+    + ("/* padding */ " * 20)
+    + """</script>
+<script>var tiny = 1;</script>
+</head><body><p>hello</p></body></html>
+"""
+)
+
+
+def test_prepare_static_snapshot_can_keep_json_scripts() -> None:
+    stripped = prepare_static_snapshot(_DATA_PAGE)
+    assert "<script" not in stripped
+    kept = prepare_static_snapshot(_DATA_PAGE, keep_data_scripts=True)
+    assert kept.count("<script") == 1 and "application/ld+json" in kept
+    assert "PAGE_MODEL" not in kept  # executable inline scripts still go
+
+
+def test_extract_data_scripts_collects_json_and_inline_data() -> None:
+    data = extract_data_scripts(_DATA_PAGE)
+    assert [s["type"] for s in data["json_scripts"]] == ["application/ld+json"]
+    assert len(data["inline_scripts"]) == 1
+    assert data["inline_scripts"][0]["text"].startswith("window.PAGE_MODEL")

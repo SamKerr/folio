@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from folio.capture import (
     prepare_page,
 )
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
+from folio.offline import extract_data_scripts
 from folio.urls import (
     is_excluded_url,
     is_included_url,
@@ -119,13 +121,16 @@ async def run_crawl(
     include_patterns: tuple[str, ...] = (),
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
+    data_sidecar: bool = False,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
 
     ``include_patterns`` restrict the crawl to matching URLs (start URLs always
     allowed); ``keep_query`` gives query-string URLs their own files;
-    ``extra_start_urls`` are additional same-host seeds.
+    ``extra_start_urls`` are additional same-host seeds. ``data_sidecar`` keeps
+    JSON scripts in the snapshot and writes each page's embedded data (JSON and
+    inline data scripts) to ``<page>.data.json`` for offline parsing.
     """
     root_url = normalize_url(start_url)
     if is_excluded_url(root_url, exclude_patterns):
@@ -165,6 +170,7 @@ async def run_crawl(
                 include_patterns=include_patterns,
                 keep_query=keep_query,
                 extra_start_urls=tuple(seeds),
+                data_sidecar=data_sidecar,
                 verbose=verbose,
             )
         finally:
@@ -201,6 +207,7 @@ async def _crawl_with_browser(
     include_patterns: tuple[str, ...] = (),
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
+    data_sidecar: bool = False,
     verbose: bool,
 ) -> tuple[int, int]:
     context = await browser.new_context()
@@ -212,6 +219,7 @@ async def _crawl_with_browser(
         concurrency=asset_concurrency,
         keep_query=keep_query,
     )
+    asset_mirror.keep_data_scripts = data_sidecar
 
     login_page = await context.new_page()
     try:
@@ -249,6 +257,7 @@ async def _crawl_with_browser(
             include_patterns=include_patterns,
             keep_query=keep_query,
             extra_start_urls=extra_start_urls,
+            data_sidecar=data_sidecar,
             verbose=verbose,
         )
     finally:
@@ -276,6 +285,7 @@ async def _crawl_pages_parallel(
     include_patterns: tuple[str, ...] = (),
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
+    data_sidecar: bool = False,
     verbose: bool,
 ) -> tuple[int, int]:
     queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
@@ -410,6 +420,7 @@ async def _crawl_pages_parallel(
                             exclude_patterns=exclude_patterns,
                             include_patterns=include_patterns,
                             keep_query=keep_query,
+                            data_sidecar=data_sidecar,
                             asset_tracker=asset_tracker,
                         )
                         if discovered is None:
@@ -466,6 +477,7 @@ async def _save_page(
     asset_tracker: AssetQuietTracker,
     include_patterns: tuple[str, ...] = (),
     keep_query: bool = False,
+    data_sidecar: bool = False,
 ) -> list[str] | None:
     """Fetch one page and return same-host links discovered on it."""
     if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
@@ -488,6 +500,12 @@ async def _save_page(
     )
     out_path = url_to_output_path(url, output_dir, keep_query=keep_query)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if data_sidecar:
+        raw_html = await page.content()
+        sidecar = {"url": url, **extract_data_scripts(raw_html)}
+        out_path.with_suffix(".data.json").write_text(
+            json.dumps(sidecar, ensure_ascii=False), encoding="utf-8"
+        )
     network_urls = set(capture.urls)
     try:
         html = await asset_mirror.mirror_page(

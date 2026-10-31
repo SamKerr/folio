@@ -236,6 +236,7 @@ class AssetMirror:
         self._request = request
         self._output_dir = output_dir
         self._keep_query = keep_query
+        self.keep_data_scripts = False
         self._assets_root = output_dir / assets_dirname
         self._cache: dict[str, Path] = {}
         self._in_progress: set[str] = set()
@@ -262,7 +263,9 @@ class AssetMirror:
             html_path=html_path,
             root_url=root_url,
         )
-        return prepare_static_snapshot(rewritten)
+        return prepare_static_snapshot(
+            rewritten, keep_data_scripts=self.keep_data_scripts
+        )
 
     async def ensure_assets(self, urls: Iterable[str], *, base: str) -> None:
         """Download many assets concurrently."""

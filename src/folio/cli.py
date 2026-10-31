@@ -145,6 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl_parser.add_argument(
+        "--data-sidecar",
+        action="store_true",
+        help=(
+            "Keep JSON scripts in the snapshot and write each page's embedded data "
+            "(JSON-LD, inline data scripts) to <page>.data.json for offline parsing"
+        ),
+    )
+    crawl_parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser headless (not recommended when login is required)",
@@ -192,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
                     extra_start_urls=tuple(args.url[1:]),
                     include_patterns=tuple(args.include),
                     keep_query=args.keep_query,
+                    data_sidecar=args.data_sidecar,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,

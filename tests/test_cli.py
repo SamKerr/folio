@@ -112,6 +112,7 @@ def test_crawl_passes_include_keep_query_and_extra_urls(
                 "--include",
                 "/p/*",
                 "--keep-query",
+                "--data-sidecar",
                 "--headless",
                 "--skip-login-wait",
             ]
@@ -123,4 +124,5 @@ def test_crawl_passes_include_keep_query_and_extra_urls(
     assert kwargs["extra_start_urls"] == ("https://a.com/y",)
     assert kwargs["include_patterns"] == ("/p/*",)
     assert kwargs["keep_query"] is True
+    assert kwargs["data_sidecar"] is True
     assert "saved 2 new page(s)" in capsys.readouterr().out
