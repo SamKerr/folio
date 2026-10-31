@@ -22,7 +22,8 @@ from folio.capture import (
     prepare_page,
 )
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
-from folio.offline import extract_data_scripts
+from folio.offline import DATA_MARKERS, extract_data_scripts, prepare_data_snapshot
+from folio.storage import find_saved_page, read_text, sidecar_path, write_text_atomic
 from folio.urls import (
     is_excluded_url,
     is_included_url,
@@ -89,7 +90,7 @@ def extract_links_from_saved_html(
         try:
             if href.startswith(("http://", "https://")):
                 normalized = normalize_url(href)
-            elif href.endswith(".html"):
+            elif href.endswith((".html", ".html.gz")):
                 target_path = (html_path.parent / href).resolve()
                 url = output_path_to_url(target_path, output_dir, root_url)
                 if url is None:
@@ -132,6 +133,9 @@ async def run_crawl(
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
     data_sidecar: bool = False,
+    data_only: bool = False,
+    data_markers: tuple[str, ...] = (),
+    gzip_output: bool = False,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
@@ -141,7 +145,17 @@ async def run_crawl(
     ``extra_start_urls`` are additional same-host seeds. ``data_sidecar`` keeps
     JSON scripts in the snapshot and writes each page's embedded data (JSON and
     inline data scripts) to ``<page>.data.json`` for offline parsing.
+
+    ``data_only`` mirrors no assets: each page is saved as a reduced snapshot
+    (:func:`folio.offline.prepare_data_snapshot`) plus a sidecar holding only JSON
+    scripts and inline scripts containing a page-state marker
+    (:data:`folio.offline.DATA_MARKERS` plus ``data_markers``). ``gzip_output``
+    (data-only only) writes ``<page>.html.gz`` / ``<page>.data.json.gz``.
     """
+    if gzip_output and not data_only:
+        msg = "gzip output is only supported for data-only crawls"
+        raise ValueError(msg)
+    markers = tuple(dict.fromkeys(DATA_MARKERS + tuple(data_markers)))
     root_url = normalize_url(start_url)
     if is_excluded_url(root_url, exclude_patterns):
         msg = f"Start URL is excluded by pattern: {root_url}"
@@ -180,7 +194,10 @@ async def run_crawl(
                 include_patterns=include_patterns,
                 keep_query=keep_query,
                 extra_start_urls=tuple(seeds),
-                data_sidecar=data_sidecar,
+                data_sidecar=data_sidecar or data_only,
+                data_only=data_only,
+                data_markers=markers,
+                gzip_output=gzip_output,
                 verbose=verbose,
             )
         finally:
@@ -218,6 +235,9 @@ async def _crawl_with_browser(
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
     data_sidecar: bool = False,
+    data_only: bool = False,
+    data_markers: tuple[str, ...] = DATA_MARKERS,
+    gzip_output: bool = False,
     verbose: bool,
 ) -> tuple[int, int]:
     context = await browser.new_context()
@@ -230,6 +250,7 @@ async def _crawl_with_browser(
         keep_query=keep_query,
     )
     asset_mirror.keep_data_scripts = data_sidecar
+    asset_mirror.gzip = gzip_output
 
     login_page = await context.new_page()
     try:
@@ -268,6 +289,9 @@ async def _crawl_with_browser(
             keep_query=keep_query,
             extra_start_urls=extra_start_urls,
             data_sidecar=data_sidecar,
+            data_only=data_only,
+            data_markers=data_markers,
+            gzip_output=gzip_output,
             verbose=verbose,
         )
     finally:
@@ -296,6 +320,9 @@ async def _crawl_pages_parallel(
     keep_query: bool = False,
     extra_start_urls: tuple[str, ...] = (),
     data_sidecar: bool = False,
+    data_only: bool = False,
+    data_markers: tuple[str, ...] = DATA_MARKERS,
+    gzip_output: bool = False,
     verbose: bool,
 ) -> tuple[int, int]:
     queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
@@ -383,20 +410,21 @@ async def _crawl_pages_parallel(
                         visited.add(url)
 
                     out_path = url_to_output_path(
-                        url, output_dir, keep_query=keep_query
+                        url, output_dir, keep_query=keep_query, gzip=gzip_output
                     )
                     discovered: list[str] | None
-                    if resume and out_path.is_file():
+                    saved_path = find_saved_page(out_path) if resume else None
+                    if saved_path is not None:
                         if verbose:
                             print(
                                 f"Skipping (exists): {url}",
                                 file=sys.stderr,
                                 flush=True,
                             )
-                        html = out_path.read_text(encoding="utf-8")
+                        html = read_text(saved_path)
                         discovered = extract_links_from_saved_html(
                             html,
-                            html_path=out_path,
+                            html_path=saved_path,
                             output_dir=output_dir,
                             root_url=root_url,
                             exclude_patterns=exclude_patterns,
@@ -431,6 +459,9 @@ async def _crawl_pages_parallel(
                             include_patterns=include_patterns,
                             keep_query=keep_query,
                             data_sidecar=data_sidecar,
+                            data_only=data_only,
+                            data_markers=data_markers,
+                            gzip_output=gzip_output,
                             asset_tracker=asset_tracker,
                         )
                         if discovered is None:
@@ -488,6 +519,9 @@ async def _save_page(
     include_patterns: tuple[str, ...] = (),
     keep_query: bool = False,
     data_sidecar: bool = False,
+    data_only: bool = False,
+    data_markers: tuple[str, ...] = DATA_MARKERS,
+    gzip_output: bool = False,
 ) -> list[str] | None:
     """Fetch one page and return same-host links discovered on it."""
     if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
@@ -508,33 +542,48 @@ async def _save_page(
         skip_interact=True,
         asset_tracker=asset_tracker,
     )
-    out_path = url_to_output_path(url, output_dir, keep_query=keep_query)
+    out_path = url_to_output_path(
+        url, output_dir, keep_query=keep_query, gzip=gzip_output
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if data_sidecar:
+    if data_only:
         raw_html = await page.content()
-        sidecar = {"url": url, **extract_data_scripts(raw_html)}
-        out_path.with_suffix(".data.json").write_text(
-            json.dumps(sidecar, ensure_ascii=False), encoding="utf-8"
+        sidecar = {"url": url, **extract_data_scripts(raw_html, markers=data_markers)}
+        write_text_atomic(
+            sidecar_path(out_path), json.dumps(sidecar, ensure_ascii=False)
         )
-    network_urls = set(capture.urls)
-    try:
-        html = await asset_mirror.mirror_page(
-            page,
-            page_url=url,
-            html_path=out_path,
-            root_url=root_url,
-            extra_urls=network_urls,
+        reduced = prepare_data_snapshot(raw_html, base_url=url)
+        html = asset_mirror.rewrite_anchors(
+            reduced, page_url=url, html_path=out_path, root_url=root_url
         )
-    except Exception as exc:
-        print(
-            f"Warning: asset mirroring failed for {url}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None
+        write_text_atomic(out_path, html)  # page file last: it marks the page done
+        capture.clear()
+    else:
+        if data_sidecar:
+            raw_html = await page.content()
+            sidecar = {"url": url, **extract_data_scripts(raw_html)}
+            sidecar_path(out_path).write_text(
+                json.dumps(sidecar, ensure_ascii=False), encoding="utf-8"
+            )
+        network_urls = set(capture.urls)
+        try:
+            html = await asset_mirror.mirror_page(
+                page,
+                page_url=url,
+                html_path=out_path,
+                root_url=root_url,
+                extra_urls=network_urls,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: asset mirroring failed for {url}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
 
-    out_path.write_text(html, encoding="utf-8")
-    capture.clear()
+        out_path.write_text(html, encoding="utf-8")
+        capture.clear()
 
     discovered: list[str] = []
     for link in raw_links:

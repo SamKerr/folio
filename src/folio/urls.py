@@ -120,13 +120,20 @@ def query_tag(query: str) -> str:
     return "q" + hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
 
 
-def url_to_output_path(url: str, output_dir: Path, *, keep_query: bool = False) -> Path:
+def url_to_output_path(
+    url: str, output_dir: Path, *, keep_query: bool = False, gzip: bool = False
+) -> Path:
     """Map a crawled URL to a local HTML file under output_dir.
 
     With ``keep_query`` a URL that carries a query string gets its own file,
     ``<name>.q<hash>.html``, so search pages that differ only by query (page 2,
-    filters) do not overwrite each other.
+    filters) do not overwrite each other. With ``gzip`` the name ends ``.html.gz``.
     """
+    path = _url_to_html_path(url, output_dir, keep_query=keep_query)
+    return path.with_name(path.name + ".gz") if gzip else path
+
+
+def _url_to_html_path(url: str, output_dir: Path, *, keep_query: bool) -> Path:
     parsed = urlparse(url)
     host_dir = output_dir / parsed.netloc.lower()
     path = parsed.path or "/"
@@ -152,6 +159,8 @@ def output_path_to_url(path: Path, output_dir: Path, root_url: str) -> str | Non
     except ValueError:
         return None
 
+    if relative.suffix == ".gz":
+        relative = relative.with_name(relative.name[:-3])
     if relative.suffix != ".html":
         return None
     stem = QUERY_SUFFIX.sub("", relative.stem)  # the query itself is not recoverable

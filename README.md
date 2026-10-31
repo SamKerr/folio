@@ -77,6 +77,42 @@ uv run folio crawl "https://www.example.com/search?area=leeds" \
 
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
+## Data-only crawls
+
+For large crawls where another program only needs each page's embedded data and visible
+text (not an offline-browsable copy), skip asset mirroring entirely:
+
+```bash
+uv run folio crawl "https://www.example.com/search?area=leeds" \
+  --include "/search*" --include "/listing/*" --keep-query \
+  --data-only --gzip --concurrency 2 --delay 2 --headless --skip-login-wait
+```
+
+- `--data-only`: no `_assets` downloads, no inlined CSS / fonts / images. Each page is saved
+  as a **reduced snapshot**: `<title>`, `<meta>` tags, body text and structure, `<link
+  rel=canonical|next|prev>` (made absolute) and same-host anchors with `data-folio-url` (so
+  resume and link discovery work). Removed: executable scripts (JSON scripts stay), `<style>`,
+  `<svg>`, other `<link>`s, `<img>` / `<picture>` / `<source>` / `<video>` / `<audio>`,
+  `<iframe>`, `<noscript>`, `<object>` / `<embed>`, `style=` and `on*=` attributes, comments.
+  A `<page>.data.json` sidecar is always written, holding JSON scripts plus only the inline
+  scripts that look like page state (`__PAGE_MODEL`, `PAGE_MODEL`, `__NEXT_DATA__`,
+  `__PRELOADED_STATE__`, `__INITIAL_STATE__`, `__NUXT__`, `__APOLLO_STATE__`,
+  `__REDUX_STATE__`, `initialState`, `window.__data`); any single script over 2 MB is dropped.
+- `--data-marker TEXT` (repeatable): add a page-state marker for a site the list misses.
+- `--gzip` (with `--data-only`): write `<page>.html.gz` and `<page>.data.json.gz`. Resume
+  finds a page under either name, so a crawl can switch between plain and gzip.
+
+Convert an existing saved site in place (atomic writes, safe to re-run, never touches the
+shared `_assets` folder; don't run it on a folder a crawl is writing to):
+
+```bash
+uv run folio slim output/www.example.com          # .html -> reduced, .data.json -> filtered
+uv run folio slim output/www.example.com --gzip   # ... and replace each file with <name>.gz
+```
+
+On one real listing page this took the HTML from 1.1 MB to 94 KB (18.5 KB gzipped) and its
+sidecar from 627 KB to 117 KB (25 KB gzipped).
+
 ## Caveats
 
 - Same hostname only (CDN assets are still downloaded).

@@ -237,6 +237,7 @@ class AssetMirror:
         self._output_dir = output_dir
         self._keep_query = keep_query
         self.keep_data_scripts = False
+        self.gzip = False  # rewritten page links point at <page>.html.gz
         self._assets_root = output_dir / assets_dirname
         self._cache: dict[str, Path] = {}
         self._in_progress: set[str] = set()
@@ -434,6 +435,25 @@ class AssetMirror:
 
         return str(soup)
 
+    def rewrite_anchors(
+        self,
+        html: str,
+        *,
+        page_url: str,
+        html_path: Path,
+        root_url: str,
+    ) -> str:
+        """Rewrite only same-host anchors (data-only mode: no assets involved)."""
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            self._rewrite_anchor(
+                anchor,
+                page_url=page_url,
+                html_path=html_path,
+                root_url=root_url,
+            )
+        return str(soup)
+
     def _rewrite_srcset_attr(
         self,
         tag: Tag,
@@ -524,7 +544,7 @@ class AssetMirror:
         if not same_host(absolute, root_url):
             return
         local_page = url_to_output_path(
-            absolute, self._output_dir, keep_query=self._keep_query
+            absolute, self._output_dir, keep_query=self._keep_query, gzip=self.gzip
         )
         anchor["href"] = relative_uri(html_path, local_page)
         anchor["data-folio-url"] = absolute  # exact URL for resume (query included)

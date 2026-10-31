@@ -6,6 +6,7 @@ from pathlib import Path
 from folio import __version__
 from folio.crawler import run_crawl
 from folio.doctor import run_doctor
+from folio.offline import DATA_MARKERS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +154,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl_parser.add_argument(
+        "--data-only",
+        action="store_true",
+        help=(
+            "Mirror no assets: save a reduced snapshot (text, meta, links) plus a "
+            "<page>.data.json holding only JSON and page-state scripts"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--data-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help=(
+            "Extra substring marking an inline script as page state (repeatable; "
+            f"built in: {', '.join(DATA_MARKERS)})"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--gzip",
+        action="store_true",
+        help="With --data-only: write <page>.html.gz and <page>.data.json.gz",
+    )
+    crawl_parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser headless (not recommended when login is required)",
@@ -163,7 +187,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start crawling immediately without waiting for Enter",
     )
 
+    slim_parser = subparsers.add_parser(
+        "slim",
+        help="Convert an existing saved site in place to the --data-only form",
+    )
+    slim_parser.add_argument(
+        "directory",
+        type=Path,
+        help="Saved site folder (e.g. output/www.example.com); _assets is left alone",
+    )
+    slim_parser.add_argument(
+        "--gzip",
+        action="store_true",
+        help="Rewrite each file as <name>.gz and remove the plain file",
+    )
+    slim_parser.add_argument(
+        "--data-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Extra page-state marker for sidecar filtering (repeatable)",
+    )
+
     return parser
+
+
+def _format_bytes(count: int) -> str:
+    size = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{count} B"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,7 +246,30 @@ def main(argv: list[str] | None = None) -> int:
         run_gui()
         return 0
 
+    if command == "slim":
+        from folio.slim import slim_site
+
+        directory: Path = args.directory
+        if not directory.is_dir():
+            print(f"Not a directory: {directory}", file=sys.stderr)
+            return 1
+        stats = slim_site(
+            directory, gzip_output=args.gzip, extra_markers=tuple(args.data_marker)
+        )
+        print(
+            f"Slimmed {stats.html_files} page(s): "
+            f"{_format_bytes(stats.html_before)} -> {_format_bytes(stats.html_after)}; "
+            f"{stats.sidecar_files} sidecar(s): "
+            f"{_format_bytes(stats.sidecar_before)} -> "
+            f"{_format_bytes(stats.sidecar_after)}; "
+            f"{stats.changed} file(s) rewritten, {stats.failed} failed"
+        )
+        return 1 if stats.failed else 0
+
     if command == "crawl":
+        if args.gzip and not args.data_only:
+            print("--gzip requires --data-only", file=sys.stderr)
+            return 1
         try:
             result = asyncio.run(
                 run_crawl(
@@ -201,6 +279,9 @@ def main(argv: list[str] | None = None) -> int:
                     include_patterns=tuple(args.include),
                     keep_query=args.keep_query,
                     data_sidecar=args.data_sidecar,
+                    data_only=args.data_only,
+                    data_markers=tuple(args.data_marker),
+                    gzip_output=args.gzip,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,

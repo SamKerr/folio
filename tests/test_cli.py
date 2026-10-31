@@ -126,3 +126,56 @@ def test_crawl_passes_include_keep_query_and_extra_urls(
     assert kwargs["keep_query"] is True
     assert kwargs["data_sidecar"] is True
     assert "saved 2 new page(s)" in capsys.readouterr().out
+
+
+def test_crawl_passes_data_only_markers_and_gzip() -> None:
+    from folio.crawler import CrawlResult
+
+    result = CrawlResult("https://a.com/x", 1, 0, Path("output"))
+    with patch(
+        "folio.cli.run_crawl", new_callable=AsyncMock, return_value=result
+    ) as mock_crawl:
+        code = main(
+            [
+                "crawl",
+                "https://a.com/x",
+                "--data-only",
+                "--data-marker",
+                "__MY_STATE__",
+                "--data-marker",
+                "listingData",
+                "--gzip",
+                "--skip-login-wait",
+            ]
+        )
+    assert code == 0
+    assert mock_crawl.await_args is not None
+    kwargs = mock_crawl.await_args.kwargs
+    assert kwargs["data_only"] is True
+    assert kwargs["data_markers"] == ("__MY_STATE__", "listingData")
+    assert kwargs["gzip_output"] is True
+
+
+def test_crawl_gzip_without_data_only_fails(capsys: CaptureFixture[str]) -> None:
+    with patch("folio.cli.run_crawl", new_callable=AsyncMock) as mock_crawl:
+        assert main(["crawl", "https://a.com/x", "--gzip"]) == 1
+    mock_crawl.assert_not_called()
+    assert "--gzip requires --data-only" in capsys.readouterr().err
+
+
+def test_slim_command(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    from folio.slim import SlimStats
+
+    stats = SlimStats(html_files=2, html_before=2048, html_after=1024, changed=2)
+    with patch("folio.slim.slim_site", return_value=stats) as mock_slim:
+        assert main(["slim", str(tmp_path), "--gzip", "--data-marker", "X"]) == 0
+    mock_slim.assert_called_once_with(tmp_path, gzip_output=True, extra_markers=("X",))
+    out = capsys.readouterr().out
+    assert "Slimmed 2 page(s): 2.0 KB -> 1.0 KB" in out
+
+
+def test_slim_command_rejects_missing_dir(
+    tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    assert main(["slim", str(tmp_path / "nope")]) == 1
+    assert "Not a directory" in capsys.readouterr().err
