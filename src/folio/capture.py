@@ -17,6 +17,8 @@ from folio.browser_scripts import (
     WAIT_FOR_IMAGES,
 )
 
+PAGE_LINK_SELECTOR = 'a[href], link[rel~="next"][href], link[rel~="prev"][href]'
+"""Anchors plus non-anchor pagination links (``<link rel="next">``)."""
 DEFAULT_CLICK_DELAY_MS = 250
 DEFAULT_ASSET_QUIET_MS = 750
 DEFAULT_PAGE_ASSET_TIMEOUT_MS = 60_000
@@ -190,7 +192,7 @@ async def discover_links_with_interaction(
     """Return hrefs found after expanding chevrons and accordion sections."""
     if click_delay_ms <= 0:
         fallback_links: list[str] = await page.eval_on_selector_all(
-            "a[href]",
+            PAGE_LINK_SELECTOR,
             "elements => elements.map(element => element.href)",
         )
         return [link for link in fallback_links if link]

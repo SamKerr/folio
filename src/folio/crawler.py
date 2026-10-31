@@ -14,6 +14,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from folio.assets import AssetMirror
 from folio.capture import (
+    PAGE_LINK_SELECTOR,
     AssetQuietTracker,
     NetworkCapture,
     block_media_requests,
@@ -51,7 +52,7 @@ class CrawlResult:
 async def extract_links(page: Page) -> list[str]:
     """Return absolute href values from anchor tags on the current page."""
     raw_links: list[str] = await page.eval_on_selector_all(
-        "a[href]",
+        PAGE_LINK_SELECTOR,
         "elements => elements.map(element => element.href)",
     )
     return [link for link in raw_links if link]
@@ -69,7 +70,16 @@ def extract_links_from_saved_html(
     """Discover crawl URLs from an already-saved offline HTML file."""
     soup = BeautifulSoup(html, "html.parser")
     discovered: list[str] = []
-    for anchor in soup.find_all("a", href=True):
+    candidates = list(soup.find_all("a", href=True))
+    for link in soup.find_all("link", href=True):
+        rels = link.get("rel")
+        if isinstance(rels, str):
+            rel_values = {rels.lower()}
+        else:
+            rel_values = {str(value).lower() for value in (rels or [])}
+        if rel_values & {"next", "prev"}:
+            candidates.append(link)
+    for anchor in candidates:
         href = anchor.get("href")
         if not isinstance(href, str) or href.startswith("#"):
             continue

@@ -476,3 +476,26 @@ def test_extract_links_from_saved_html_prefers_the_recorded_url() -> None:
         include_patterns=("/find*",),
     )
     assert links == ["https://www.example.com/find?index=24"]
+
+
+@pytest.mark.asyncio
+async def test_extract_links_includes_rel_next_links() -> None:
+    page = AsyncMock()
+    page.eval_on_selector_all.return_value = ["https://example.com/p?index=24"]
+    assert await extract_links(page) == ["https://example.com/p?index=24"]
+    selector = page.eval_on_selector_all.await_args.args[0]
+    assert 'link[rel~="next"]' in selector and "a[href]" in selector
+
+
+def test_extract_links_from_saved_html_follows_rel_next() -> None:
+    html = (
+        '<link rel="next" href="https://www.example.com/find?index=24">'
+        '<link rel="stylesheet" href="https://www.example.com/x.css">'
+    )
+    links = extract_links_from_saved_html(
+        html,
+        html_path=Path("output/www.example.com/find.html"),
+        output_dir=Path("output"),
+        root_url="https://www.example.com/",
+    )
+    assert links == ["https://www.example.com/find?index=24"]

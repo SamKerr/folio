@@ -7,6 +7,7 @@
   exact URL (`data-folio-url`) so resume follows them
 - Several start URLs on one host (positional `url` takes many)
 - `--data-sidecar`: keep JSON scripts, write `<page>.data.json` with the page's embedded data
+- Follow `<link rel=next>` pagination as well as anchors
 - Tests, README; CLI only (the GUI keeps its current options)
 
 ## Out of scope
@@ -18,6 +19,7 @@
 
 - [x] `T11-include-keep-query-seeds`
 - [x] `T12-data-sidecar`
+- [x] `T13-rel-next-pagination`
 
 ## Done criteria
 

@@ -357,6 +357,14 @@ async (delayMs) => {
                 links.add(href);
             }
         }
+        // Pagination that is not an anchor: <link rel="next|prev" href=...>.
+        for (const link of document.querySelectorAll(
+            'link[rel~="next"][href], link[rel~="prev"][href]'
+        )) {
+            if (link.href) {
+                links.add(link.href);
+            }
+        }
     };
 
     const safeClick = async (element) => {
