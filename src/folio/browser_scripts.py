@@ -409,6 +409,20 @@ async (delayMs) => {
 """
 )
 
+CHECK_DATA_MARKERS = """
+(markers) => {
+    let found = false;
+    for (const script of document.scripts) {
+        const text = script.text;
+        if (text && markers.some((marker) => text.includes(marker))) {
+            found = true;
+            break;
+        }
+    }
+    return { found, complete: document.readyState === "complete" };
+}
+"""
+
 BROWSER_SCRIPTS = {
     "extract_asset_urls": EXTRACT_ASSET_URLS,
     "scroll_page": SCROLL_PAGE,
@@ -416,4 +430,5 @@ BROWSER_SCRIPTS = {
     "wait_for_diagrams": WAIT_FOR_DIAGRAMS,
     "interact_with_page": INTERACT_WITH_PAGE,
     "discover_links_with_interaction": DISCOVER_LINKS_WITH_INTERACTION,
+    "check_data_markers": CHECK_DATA_MARKERS,
 }

@@ -4,7 +4,12 @@ import sys
 from pathlib import Path
 
 from folio import __version__
-from folio.crawler import run_crawl
+from folio.capture import (
+    DEFAULT_DATA_NAVIGATION_TIMEOUT_MS,
+    DEFAULT_DATA_SETTLE_MS,
+    DEFAULT_MARKER_TIMEOUT_MS,
+)
+from folio.crawler import CrawlResult, run_crawl
 from folio.doctor import run_doctor
 from folio.offline import DATA_MARKERS
 
@@ -56,10 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_parser.add_argument(
         "--settle-ms",
         type=int,
-        default=1000,
+        default=None,
         help=(
             "Milliseconds to wait after assets settle for late injections "
-            "(default: 1000)"
+            f"(default: 1000; {DEFAULT_DATA_SETTLE_MS} in fast --data-only mode)"
         ),
     )
     crawl_parser.add_argument(
@@ -95,8 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_parser.add_argument(
         "--timeout",
         type=int,
-        default=60,
-        help="Navigation timeout in seconds per page (default: 60)",
+        default=None,
+        help=(
+            "Navigation timeout in seconds per page (default: 60; "
+            f"{DEFAULT_DATA_NAVIGATION_TIMEOUT_MS // 1000} in fast --data-only mode)"
+        ),
     )
     crawl_parser.add_argument(
         "--concurrency",
@@ -158,8 +166,51 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Mirror no assets: save a reduced snapshot (text, meta, links) plus a "
-            "<page>.data.json holding only JSON and page-state scripts"
+            "<page>.data.json holding only JSON and page-state scripts. Fast: blocks "
+            "images, fonts, CSS, media and third-party hosts and skips render waits"
         ),
+    )
+    crawl_parser.add_argument(
+        "--full-render",
+        action="store_true",
+        help=(
+            "With --data-only: load every resource and keep the normal render waits "
+            "(chevron clicks, scrolling, image / asset waits) and timeouts"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Fast --data-only: also load scripts / XHR / fetch from this host "
+            "(repeatable; a host covers its subdomains, globs like *.cloudfront.net)"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--wait-for-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help=(
+            "Fast --data-only: wait for a <script> containing this text (repeatable; "
+            "default: the page-state markers, including --data-marker)"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--marker-timeout-ms",
+        type=int,
+        default=DEFAULT_MARKER_TIMEOUT_MS,
+        help=(
+            "Fast --data-only: max ms to wait for a marker; stops early once the page "
+            f"has loaded (default: {DEFAULT_MARKER_TIMEOUT_MS}; 0 skips the wait)"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print pages per minute and seconds per page at the end",
     )
     crawl_parser.add_argument(
         "--data-marker",
@@ -221,6 +272,20 @@ def _format_bytes(count: int) -> str:
     return f"{count} B"
 
 
+def format_crawl_stats(result: CrawlResult, concurrency: int) -> str:
+    """One line of crawl throughput: pages / minute and seconds per page."""
+    pages = result.pages_saved
+    seconds = result.crawl_seconds
+    if pages <= 0 or seconds <= 0:
+        return f"Stats: {pages} new page(s) in {seconds:.1f} s"
+    return (
+        f"Stats: {pages} new page(s) in {seconds:.1f} s: "
+        f"{pages * 60 / seconds:.1f} pages/min, {seconds / pages:.2f} s/page wall, "
+        f"{result.page_seconds / pages:.2f} s/page per tab "
+        f"(concurrency {concurrency})"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -270,6 +335,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.gzip and not args.data_only:
             print("--gzip requires --data-only", file=sys.stderr)
             return 1
+        fast = args.data_only and not args.full_render
+        settle_ms = args.settle_ms
+        if settle_ms is None:
+            settle_ms = DEFAULT_DATA_SETTLE_MS if fast else 1000
+        timeout_ms = (
+            args.timeout * 1000
+            if args.timeout is not None
+            else (DEFAULT_DATA_NAVIGATION_TIMEOUT_MS if fast else 60_000)
+        )
         try:
             result = asyncio.run(
                 run_crawl(
@@ -282,18 +356,22 @@ def main(argv: list[str] | None = None) -> int:
                     data_only=args.data_only,
                     data_markers=tuple(args.data_marker),
                     gzip_output=args.gzip,
+                    full_render=args.full_render,
+                    allow_hosts=tuple(args.allow_host),
+                    wait_markers=tuple(args.wait_for_marker),
+                    marker_timeout_ms=args.marker_timeout_ms,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,
                     max_pages=args.max_pages,
-                    settle_ms=args.settle_ms,
+                    settle_ms=settle_ms,
                     image_wait_ms=args.image_wait_ms,
                     asset_quiet_ms=args.asset_quiet_ms,
                     page_asset_timeout_ms=args.page_asset_timeout_ms,
                     diagram_wait_ms=args.diagram_wait_ms,
                     asset_concurrency=args.asset_concurrency,
                     page_concurrency=args.concurrency,
-                    navigation_timeout_ms=args.timeout * 1000,
+                    navigation_timeout_ms=timeout_ms,
                     resume=not args.force,
                     exclude_patterns=tuple(args.exclude),
                     verbose=not args.quiet,
@@ -308,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
             f"skipped {result.pages_skipped} existing, under "
             f"{result.output_dir.resolve()}"
         )
+        if args.stats:
+            print(format_crawl_stats(result, args.concurrency))
         return 0
 
     parser.print_help()

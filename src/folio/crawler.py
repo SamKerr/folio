@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from folio.capture import (
     NetworkCapture,
     block_media_requests,
     discover_links_with_interaction,
+    install_data_request_filter,
+    prepare_data_page,
     prepare_page,
 )
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
@@ -48,6 +51,19 @@ class CrawlResult:
     pages_saved: int
     pages_skipped: int
     output_dir: Path
+    crawl_seconds: float = 0.0
+    """Wall time of the crawl phase (after the browser and login page are up)."""
+    page_seconds: float = 0.0
+    """Summed time spent fetching and saving new pages, across all tabs."""
+
+
+@dataclass(frozen=True)
+class FastDataOptions:
+    """Settings for fast data-only crawls (``data_only`` without ``full_render``)."""
+
+    allow_hosts: tuple[str, ...] = ()
+    markers: tuple[str, ...] = DATA_MARKERS
+    marker_timeout_ms: int = 3000
 
 
 async def extract_links(page: Page) -> list[str]:
@@ -136,6 +152,10 @@ async def run_crawl(
     data_only: bool = False,
     data_markers: tuple[str, ...] = (),
     gzip_output: bool = False,
+    full_render: bool = False,
+    allow_hosts: tuple[str, ...] = (),
+    wait_markers: tuple[str, ...] = (),
+    marker_timeout_ms: int = 3000,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
@@ -151,6 +171,13 @@ async def run_crawl(
     scripts and inline scripts containing a page-state marker
     (:data:`folio.offline.DATA_MARKERS` plus ``data_markers``). ``gzip_output``
     (data-only only) writes ``<page>.html.gz`` / ``<page>.data.json.gz``.
+
+    Data-only crawls are *fast* unless ``full_render``: requests that carry no
+    data are aborted (:func:`folio.capture.request_allowed`; ``allow_hosts`` adds
+    hosts to the site), service workers are blocked, and instead of the render
+    waits each page waits for ``domcontentloaded`` (no ``commit`` fallback), a
+    page-state marker in a ``<script>`` (``wait_markers``, default the sidecar
+    markers; at most ``marker_timeout_ms``) and ``settle_ms``.
     """
     if gzip_output and not data_only:
         msg = "gzip output is only supported for data-only crawls"
@@ -168,11 +195,20 @@ async def run_crawl(
             raise ValueError(msg)
         seeds.append(normalized)
     output_dir.mkdir(parents=True, exist_ok=True)
+    fast = (
+        FastDataOptions(
+            allow_hosts=tuple(allow_hosts),
+            markers=tuple(wait_markers) or markers,
+            marker_timeout_ms=marker_timeout_ms,
+        )
+        if data_only and not full_render
+        else None
+    )
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not headed)
         try:
-            pages_saved, pages_skipped = await _crawl_with_browser(
+            counts = await _crawl_with_browser(
                 browser,
                 root_url,
                 output_dir,
@@ -198,16 +234,20 @@ async def run_crawl(
                 data_only=data_only,
                 data_markers=markers,
                 gzip_output=gzip_output,
+                fast=fast,
                 verbose=verbose,
             )
         finally:
             await browser.close()
 
+    pages_saved, pages_skipped, crawl_seconds, page_seconds = counts
     return CrawlResult(
         start_url=root_url,
         pages_saved=pages_saved,
         pages_skipped=pages_skipped,
         output_dir=output_dir,
+        crawl_seconds=crawl_seconds,
+        page_seconds=page_seconds,
     )
 
 
@@ -238,9 +278,12 @@ async def _crawl_with_browser(
     data_only: bool = False,
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
+    fast: FastDataOptions | None = None,
     verbose: bool,
-) -> tuple[int, int]:
-    context = await browser.new_context()
+) -> tuple[int, int, float, float]:
+    context = await browser.new_context(
+        service_workers="block" if fast is not None else "allow"
+    )
     context.set_default_navigation_timeout(navigation_timeout_ms)
     context.set_default_timeout(navigation_timeout_ms)
     asset_mirror = AssetMirror(
@@ -292,6 +335,7 @@ async def _crawl_with_browser(
             data_only=data_only,
             data_markers=data_markers,
             gzip_output=gzip_output,
+            fast=fast,
             verbose=verbose,
         )
     finally:
@@ -323,8 +367,9 @@ async def _crawl_pages_parallel(
     data_only: bool = False,
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
+    fast: FastDataOptions | None = None,
     verbose: bool,
-) -> tuple[int, int]:
+) -> tuple[int, int, float, float]:
     queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
     section_ranks: dict[str, int] = {"": 0}
     section_lock = asyncio.Lock()
@@ -361,6 +406,8 @@ async def _crawl_pages_parallel(
     stop_lock = asyncio.Lock()
     in_flight = 0
     flight_lock = asyncio.Lock()
+    page_seconds = 0.0
+    crawl_started = time.monotonic()
 
     async def should_stop() -> bool:
         async with stop_lock:
@@ -376,13 +423,19 @@ async def _crawl_pages_parallel(
             return in_flight == 0 and queue.empty()
 
     async def worker() -> None:
-        nonlocal pages_saved, pages_skipped, in_flight
+        nonlocal pages_saved, pages_skipped, in_flight, page_seconds
         page = await context.new_page()
-        await block_media_requests(page)
         capture = NetworkCapture()
-        capture.attach(page)
         asset_tracker = AssetQuietTracker()
-        asset_tracker.attach(page)
+        if fast is not None:
+            # No asset capture or quiet tracking: nothing visual is saved.
+            await install_data_request_filter(
+                page, root_url, allow_hosts=fast.allow_hosts
+            )
+        else:
+            await block_media_requests(page)
+            capture.attach(page)
+            asset_tracker.attach(page)
         try:
             while True:
                 if await should_stop() and await worker_done():
@@ -441,6 +494,7 @@ async def _crawl_pages_parallel(
                                 file=sys.stderr,
                                 flush=True,
                             )
+                        page_started = time.monotonic()
                         discovered = await _save_page(
                             page,
                             capture,
@@ -463,11 +517,13 @@ async def _crawl_pages_parallel(
                             data_markers=data_markers,
                             gzip_output=gzip_output,
                             asset_tracker=asset_tracker,
+                            fast=fast,
                         )
                         if discovered is None:
                             continue
                         async with pages_lock:
                             pages_saved += 1
+                            page_seconds += time.monotonic() - page_started
                             if max_pages is not None and pages_saved >= max_pages:
                                 await set_stop()
 
@@ -496,7 +552,7 @@ async def _crawl_pages_parallel(
 
     workers = [asyncio.create_task(worker()) for _ in range(page_concurrency)]
     await asyncio.gather(*workers)
-    return pages_saved, pages_skipped
+    return pages_saved, pages_skipped, time.monotonic() - crawl_started, page_seconds
 
 
 async def _save_page(
@@ -522,26 +578,39 @@ async def _save_page(
     data_only: bool = False,
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
+    fast: FastDataOptions | None = None,
 ) -> list[str] | None:
     """Fetch one page and return same-host links discovered on it."""
-    if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
-        return None
-
-    raw_links = await discover_links_with_interaction(
-        page,
-        click_delay_ms=click_delay_ms,
-    )
-    await prepare_page(
-        page,
-        settle_ms=settle_ms,
-        image_wait_ms=image_wait_ms,
-        asset_quiet_ms=asset_quiet_ms,
-        page_asset_timeout_ms=page_asset_timeout_ms,
-        diagram_wait_ms=diagram_wait_ms,
-        click_delay_ms=click_delay_ms,
-        skip_interact=True,
-        asset_tracker=asset_tracker,
-    )
+    if fast is not None:
+        if not await goto_page(
+            page, url, timeout_ms=navigation_timeout_ms, fallback_commit=False
+        ):
+            return None
+        await prepare_data_page(
+            page,
+            settle_ms=settle_ms,
+            markers=fast.markers,
+            marker_timeout_ms=fast.marker_timeout_ms,
+        )
+        raw_links = await extract_links(page)
+    else:
+        if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
+            return None
+        raw_links = await discover_links_with_interaction(
+            page,
+            click_delay_ms=click_delay_ms,
+        )
+        await prepare_page(
+            page,
+            settle_ms=settle_ms,
+            image_wait_ms=image_wait_ms,
+            asset_quiet_ms=asset_quiet_ms,
+            page_asset_timeout_ms=page_asset_timeout_ms,
+            diagram_wait_ms=diagram_wait_ms,
+            click_delay_ms=click_delay_ms,
+            skip_interact=True,
+            asset_tracker=asset_tracker,
+        )
     out_path = url_to_output_path(
         url, output_dir, keep_query=keep_query, gzip=gzip_output
     )

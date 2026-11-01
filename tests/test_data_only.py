@@ -255,8 +255,9 @@ async def test_data_only_crawl_writes_reduced_files_and_resumes(
 
     with (
         patch("folio.crawler.async_playwright", return_value=playwright),
-        patch("folio.crawler.prepare_page", new_callable=AsyncMock),
-        patch("folio.crawler.discover_links_with_interaction", side_effect=discover),
+        patch("folio.crawler.prepare_page", new_callable=AsyncMock) as prepare,
+        patch("folio.crawler.prepare_data_page", new_callable=AsyncMock),
+        patch("folio.crawler.extract_links", side_effect=discover),
         patch("folio.crawler.goto_page", side_effect=goto),
         patch("folio.assets.AssetMirror.mirror_page") as mirror_page,
     ):
@@ -270,6 +271,7 @@ async def test_data_only_crawl_writes_reduced_files_and_resumes(
         )
 
     mirror_page.assert_not_called()
+    prepare.assert_not_called()  # fast data-only: no render waits (T15)
     assert not (tmp_path / "_assets").exists()
     assert result.pages_skipped == 1
     assert result.pages_saved == 2  # /properties/1 and /properties/3

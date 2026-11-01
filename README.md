@@ -102,6 +102,36 @@ uv run folio crawl "https://www.example.com/search?area=leeds" \
 - `--gzip` (with `--data-only`): write `<page>.html.gz` and `<page>.data.json.gz`. Resume
   finds a page under either name, so a crawl can switch between plain and gzip.
 
+Data-only crawls are also **fast**: nothing visual is saved, so nothing visual is loaded.
+
+- **Blocked** (aborted before download): `image`, `media`, `font`, `stylesheet`,
+  `websocket`, `manifest`, `texttrack`, `other` (favicons, prefetches, ...) and `ping`
+  requests on every host, and every request to a **third-party host** (analytics, A/B-testing
+  scripts, ad / map iframes, ...). Service workers are blocked too.
+- **Still loads**: the page itself (any main-frame navigation, including redirects) and the
+  site's own `document`, `script`, `xhr` / `fetch` (and `eventsource`) requests, so the page's
+  scripts still run and set `window.__PAGE_MODEL` / `__NEXT_DATA__` etc. "The site" is the
+  start URL's host without a leading `www.`, plus its subdomains (start at
+  `www.example.com` → `example.com`, `api.example.com`, `static.example.com` load).
+- `--allow-host PATTERN` (repeatable): treat another host as part of the site (for listing
+  data served from a CDN / API domain). A plain host also covers its subdomains; globs work
+  (`--allow-host "*.cloudfront.net"`). Blocked resource types stay blocked.
+- **No render waits**: no chevron / accordion clicks, scrolling, image or diagram waits or
+  asset-quiet wait. Each page waits for `domcontentloaded`, then until a `<script>` contains
+  a page-state marker (the sidecar markers plus `--data-marker`, or your own
+  `--wait-for-marker TEXT`, repeatable) — at most `--marker-timeout-ms` (default 3000; `0`
+  skips it), and no longer than the page's `load` event when it has no marker — then
+  `--settle-ms` (default 300 here). Links come from `a[href]` and `link[rel=next|prev]`.
+- Navigation timeout defaults to 30 s (`--timeout`), and a page that times out is skipped
+  (and retried on the next resume) instead of being saved half-loaded.
+- `--full-render`: load everything and use the normal waits and timeouts (the pre-T15
+  behaviour), for a site whose data only appears after interaction.
+- `--stats`: print pages per minute and seconds per page at the end.
+
+On `books.toscrape.com` (20 pages, `--concurrency 2 --delay 0`, on a busy machine) a fast
+data-only crawl ran at 86–94 pages/min against 25–33 with `--full-render`, writing
+byte-identical files.
+
 Convert an existing saved site in place (atomic writes, safe to re-run, never touches the
 shared `_assets` folder; don't run it on a folder a crawl is writing to):
 
