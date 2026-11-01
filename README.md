@@ -43,7 +43,19 @@ Run the same command again to resume — existing pages are skipped. Add `--forc
 uv run folio gui
 ```
 
-Pick a URL, choose a capture preset (Fast / Balanced / Thorough), start the crawl, then open saved sites from the **Library** tab.
+Opens Folio in its own window. Paste a URL, pick a capture quality (Fast / Balanced /
+Thorough / Custom) and press **Start crawl**. When the browser opens, log in if you need
+to, then click **I'm logged in, continue**. The crawl view shows pages fetched, already
+saved and failed, plus the full activity log. Saved sites appear under **Library**, where
+**Open** browses a site offline and **Update** re-crawls it. Light and dark mode follow
+your system.
+
+- `uv run folio gui --browser`: open the same UI in your default browser (no native window)
+- `uv run folio gui --classic`: the previous Tkinter GUI
+
+The UI is a Vue 3 app (vendored in `src/folio/webui/static/`, no Node or build step)
+served by a local server bound to 127.0.0.1 with a per-launch token; the native window
+uses [pywebview](https://pywebview.flowrl.com/).
 
 macOS app (optional): `bash scripts/build-macos-app.sh` → open `dist/Folio.app`
 

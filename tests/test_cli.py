@@ -210,3 +210,26 @@ def test_crawl_rejects_unknown_order(capsys: CaptureFixture[str]) -> None:
             main(["crawl", "https://a.com/x", "--order", "random"])
     mock_crawl.assert_not_called()
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_gui_defaults_to_web_ui() -> None:
+    with patch("folio.webui.app.run_webui", return_value=0) as run_webui:
+        assert main(["gui"]) == 0
+    run_webui.assert_called_once_with(browser=False)
+
+
+def test_gui_browser_flag() -> None:
+    with patch("folio.webui.app.run_webui", return_value=0) as run_webui:
+        assert main(["gui", "--browser"]) == 0
+    run_webui.assert_called_once_with(browser=True)
+
+
+def test_gui_classic_flag() -> None:
+    with patch("folio.gui.run_gui") as run_gui:
+        assert main(["gui", "--classic"]) == 0
+    run_gui.assert_called_once_with()
+
+
+def test_gui_browser_and_classic_are_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        main(["gui", "--browser", "--classic"])

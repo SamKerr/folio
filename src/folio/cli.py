@@ -48,9 +48,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify Playwright and Chromium are installed and working",
     )
 
-    subparsers.add_parser(
+    gui_parser = subparsers.add_parser(
         "gui",
         help="Open the desktop GUI to configure crawls and browse saved sites",
+    )
+    gui_mode = gui_parser.add_mutually_exclusive_group()
+    gui_mode.add_argument(
+        "--browser",
+        action="store_true",
+        help="Open the GUI in your default browser instead of a native window",
+    )
+    gui_mode.add_argument(
+        "--classic",
+        action="store_true",
+        help="Use the previous Tkinter GUI",
     )
 
     crawl_parser = subparsers.add_parser(
@@ -429,10 +440,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if command == "gui":
-        from folio.gui import run_gui
+        if args.classic:
+            from folio.gui import run_gui
 
-        run_gui()
-        return 0
+            run_gui()
+            return 0
+
+        from folio.webui.app import run_webui
+
+        return run_webui(browser=args.browser)
 
     if command == "slim":
         from folio.error_pages import ErrorRules
