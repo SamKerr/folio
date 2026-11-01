@@ -574,5 +574,7 @@ def main(argv: list[str] | None = None) -> int:
             print(format_crawl_stats(result, args.concurrency))
         return 0
 
-    parser.print_help()
-    return 0
+    # No subcommand: open the desktop app. `folio --help` lists the commands.
+    from folio.webui.app import run_webui
+
+    return run_webui(browser=False)

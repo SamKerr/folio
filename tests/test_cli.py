@@ -45,10 +45,10 @@ def test_doctor_failure(capsys: CaptureFixture[str]) -> None:
     assert "playwright install chromium" in captured.err
 
 
-def test_no_command_prints_help(capsys: CaptureFixture[str]) -> None:
-    assert main([]) == 0
-    captured = capsys.readouterr()
-    assert "usage:" in captured.out.lower()
+def test_no_command_opens_gui() -> None:
+    with patch("folio.webui.app.run_webui", return_value=0) as run_webui:
+        assert main([]) == 0
+    run_webui.assert_called_once_with(browser=False)
 
 
 def test_crawl_help(capsys: CaptureFixture[str]) -> None:

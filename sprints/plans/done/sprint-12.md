@@ -20,7 +20,7 @@
 
 - [x] `T19-webui-backend`
 - [x] `T20-webui-frontend`
-- [ ] `T21-desktop-window`
+- [x] `T21-desktop-window`
 
 ## Sequencing
 
@@ -42,6 +42,13 @@
 - Manual: `uv run folio gui --browser` and `uv run folio gui` flows on macOS
 
 ## Notes
+
+- Outcome: `folio gui` opens a Vue 3 app in a pywebview window (`--browser`, `--classic`
+  alternatives). Crawl form, live run view with login prompt, and library all verified;
+  restyled in the Folio icon palette (violet, gold, parchment) at the user's request.
+- Fixed along the way: the Tk GUI's login-prompt detection could never match; scheme-less
+  localhost URLs now default to `http://`.
+- Follow-up: bare `folio` opens the GUI (user decision) — Sprint 13, T22.
 
 - Vue is vendored (not CDN) so the UI works offline.
 - The API spawns processes, so it binds 127.0.0.1 only, checks the Host header and

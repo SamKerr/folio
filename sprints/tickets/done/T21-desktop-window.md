@@ -48,7 +48,7 @@
 
 ## Acceptance criteria
 
-- [ ] `folio gui` opens the Vue UI in a native window
+- [x] `folio gui` opens the Vue UI in a native window
 - [x] `--browser` and `--classic` work
 - [x] README documents the new GUI
 
@@ -62,17 +62,17 @@
 - Retheme (user request): palette taken from the Folio icon. Violet card sidebar with a
   gold edge, parchment page, gold accents, serif wordmark/headings, site avatars in icon
   colours; dark mode is a deep-violet "night card". Window background matches.
-- **Pending:** visual check of the native window. `uv run folio gui` ran 6 s without
-  errors, but screen capture lacked permission, so the user must confirm.
+- Native window verified by the user: window opens, Browse… folder picker, opening a
+  saved site, and the quit-while-crawling confirmation all work.
 
 ## Verification
 
 - [x] `uv run pytest`
 - [x] `uv run ruff check .` (only 3 pre-existing E501s in `browser_scripts.py`)
 - [x] `uv run mypy` (only 4 pre-existing errors in `tests/test_gui_support.py`)
-- [ ] Manual check of window flows
+- [x] Manual check of window flows
 
 ## Status
 
 - Owner: Claude
-- State: In Progress
+- State: Done

@@ -25,8 +25,8 @@ CSS, images, fonts and SVGs stored locally. JavaScript is not saved.
 ## Installation
 
 ```bash
-git clone https://github.com/SamKerr/Folio.git
-cd Folio
+git clone https://github.com/SamKerr/folio.git
+cd folio
 uv sync --group dev
 uv run playwright install chromium
 uv run folio doctor   # verify the setup
@@ -37,15 +37,17 @@ uv run folio doctor   # verify the setup
 ### Desktop app
 
 ```bash
-uv run folio gui
+uv run folio
 ```
 
-Enter a URL, choose a capture quality and press **Start crawl**. If the site needs a login,
-sign in in the browser window, then click **I'm logged in, continue**. Saved sites appear
-under **Library**.
+Running `folio` on its own opens the app (`folio gui` does the same). Enter a URL, choose
+a capture quality and press **Start crawl**. If the site needs a login, sign in in the
+browser window, then click **I'm logged in, continue**. Saved sites appear under
+**Library**.
 
-Use `--browser` to open the app in your default browser instead of a native window. To
-build a macOS app bundle, run `bash scripts/build-macos-app.sh` and open `dist/Folio.app`.
+Run `folio gui --browser` to open the app in your default browser instead of a native
+window. To build a macOS app bundle, run `bash scripts/build-macos-app.sh` and open
+`dist/Folio.app`.
 
 ### Command line
 
@@ -66,7 +68,7 @@ cd output && python -m http.server 8765   # http://127.0.0.1:8765/www.example.co
 
 | Command | Description |
 |---|---|
-| `folio gui` | Open the desktop app |
+| `folio` or `folio gui` | Open the desktop app |
 | `folio crawl <url>` | Crawl a site from the terminal |
 | `folio slim <dir>` | Convert a saved site to the compact data-only form |
 | `folio doctor` | Check that Playwright and Chromium work |

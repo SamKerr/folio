@@ -7,13 +7,14 @@
 | **3** | Download and rewrite CSS, images, fonts for local paths | T07 | [sprint-3.md](sprints/plans/done/sprint-3.md) |
 | **4** | Lazy-load capture, script stripping, auth-free offline browse | T08–T09 | [sprint-4.md](sprints/plans/done/sprint-4.md) |
 | **5** | Desktop GUI: usable crawl settings, branding, and scrolling | T10 | [sprint-5.md](sprints/plans/done/sprint-5.md) |
-| **6** | Crawl a subset: include patterns, query-aware pages, several start URLs | T11–T13 | [sprint-6.md](sprints/plans/sprint-6.md) |
+| **6** | Crawl a subset: include patterns, query-aware pages, several start URLs | T11–T13 | [sprint-6.md](sprints/plans/done/sprint-6.md) |
 | **7** | Data-only crawls: reduced snapshots, data sidecars, gzip, `folio slim` | T14 | [sprint-7.md](sprints/plans/done/sprint-7.md) |
 | **8** | Fast data-only crawls: block non-data requests, skip render waits | T15 | [sprint-8.md](sprints/plans/done/sprint-8.md) |
 | **9** | Crawl order: section, discovered, and interleave | T16 | [sprint-9.md](sprints/plans/done/sprint-9.md) |
 | **10** | Never save error pages; retry failed URLs | T17 | [sprint-10.md](sprints/plans/done/sprint-10.md) |
 | **11** | Back off on rate limits; adaptive per-page delay | T18 | [sprint-11.md](sprints/plans/done/sprint-11.md) |
-| **12** | Modern desktop app: Vue UI in a native window *(in progress)* | T19–T21 | [sprint-12.md](sprints/plans/sprint-12.md) |
+| **12** | Modern desktop app: Vue UI in a native window | T19–T21 | [sprint-12.md](sprints/plans/done/sprint-12.md) |
+| **13** | Plain `folio` opens the desktop app | T22 | [sprint-13.md](sprints/plans/done/sprint-13.md) |
 
 ---
 
@@ -153,7 +154,7 @@
 
 ---
 
-## Sprint 12 — Modern desktop app *(in progress)*
+## Sprint 12 — Modern desktop app
 
 **Goal:** Replace the dated Tk interface with a modern app that matches the Folio brand.
 
@@ -163,5 +164,15 @@
 - Light and dark themes in the colours of the Folio icon
 
 **Done when:** `uv run folio gui` opens the new app in a native window and every flow works.
+
+---
+
+## Sprint 13 — Plain `folio` opens the app
+
+**Goal:** Typing `folio` on its own opens the desktop app.
+
+- No subcommand runs the app; `--help`, `--version`, and subcommands are unchanged
+
+**Done when:** `uv run folio` opens the app and `uv run folio --help` still lists the commands.
 
 ---
