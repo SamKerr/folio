@@ -8,14 +8,22 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from folio.error_pages import (
+    DEFAULT_ERROR_RULES,
+    ErrorRules,
+    html_reason,
+    sidecar_reason,
+)
 from folio.offline import DATA_MARKERS, filter_sidecar, prepare_data_snapshot
 from folio.output_catalog import ASSETS_DIRNAME
 from folio.storage import (
     SIDECAR_SUFFIX,
     encode_text,
+    find_saved_page,
     gz_path,
     plain_path,
     read_text,
+    sidecar_path,
     write_bytes_atomic,
 )
 
@@ -101,4 +109,87 @@ def slim_site(
             stats.sidecar_after += after
         if verbose and index % PROGRESS_EVERY == 0:
             print(f"Slimmed {index} file(s)...", file=sys.stderr, flush=True)
+    return stats
+
+
+@dataclass
+class DropStats:
+    pages_checked: int = 0
+    error_pages: int = 0
+    """Saved pages (with their sidecars) found to be error pages."""
+    orphan_sidecars: int = 0
+    """Error sidecars with no saved page beside them."""
+    files_deleted: int = 0
+    failed: int = 0
+
+
+def _error_reason(path: Path, kind: str, rules: ErrorRules) -> str | None:
+    text = read_text(path)
+    return html_reason(text, rules) if kind == "html" else sidecar_reason(text, rules)
+
+
+def _page_for_sidecar(side: Path) -> Path | None:
+    """The saved page beside a sidecar (either gzip twin), if any."""
+    plain_side = plain_path(side)
+    page = plain_side.with_name(plain_side.name[: -len(SIDECAR_SUFFIX)] + ".html")
+    return find_saved_page(page)
+
+
+def drop_error_pages(
+    root: Path,
+    *,
+    rules: ErrorRules = DEFAULT_ERROR_RULES,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> DropStats:
+    """Delete saved error pages under ``root`` together with their sidecars.
+
+    A page is an error page when its ``<title>`` or ``__NEXT_DATA__.page`` (in the
+    page or its sidecar) matches ``rules`` (:mod:`folio.error_pages`). A sidecar
+    with no page beside it is checked on its own. ``dry_run`` only reports.
+    ``_assets`` folders are never touched.
+    """
+    stats = DropStats()
+    files = list(_iter_saved_files(root))
+    pages = [path for path, kind in files if kind == "html"]
+    sidecars = [path for path, kind in files if kind == "sidecar"]
+
+    def delete(paths: list[Path], reason: str) -> None:
+        for path in paths:
+            if verbose:
+                verb = "Would delete" if dry_run else "Deleting"
+                print(f"{verb} ({reason}): {path}", file=sys.stderr, flush=True)
+            if not dry_run:
+                path.unlink(missing_ok=True)
+            stats.files_deleted += 1
+
+    for page in pages:
+        stats.pages_checked += 1
+        side = sidecar_path(page)
+        side_file = find_saved_page(side)
+        try:
+            reason = _error_reason(page, "html", rules)
+            if reason is None and side_file is not None:
+                reason = _error_reason(side_file, "sidecar", rules)
+        except (OSError, EOFError) as exc:
+            stats.failed += 1
+            print(f"Warning: could not read {page}: {exc}", file=sys.stderr)
+            continue
+        if reason is None:
+            continue
+        stats.error_pages += 1
+        delete([page] + ([side_file] if side_file is not None else []), reason)
+
+    for side in sidecars:
+        if _page_for_sidecar(side) is not None or not side.exists():
+            continue  # checked with its page (or deleted with it)
+        try:
+            reason = _error_reason(side, "sidecar", rules)
+        except (OSError, EOFError) as exc:
+            stats.failed += 1
+            print(f"Warning: could not read {side}: {exc}", file=sys.stderr)
+            continue
+        if reason is not None:
+            stats.orphan_sidecars += 1
+            delete([side], reason)
     return stats

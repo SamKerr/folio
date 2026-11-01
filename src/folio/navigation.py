@@ -3,12 +3,41 @@
 from __future__ import annotations
 
 import sys
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 DEFAULT_NAVIGATION_TIMEOUT_MS = 60_000
+
+
+@dataclass(frozen=True)
+class NavigationResult:
+    """Outcome of :func:`goto_page`; truthy when the page loaded.
+
+    ``status`` / ``url`` are the final (post-redirect) response's HTTP status and
+    URL, when Playwright returned a response.
+    """
+
+    ok: bool
+    status: int | None = None
+    url: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _response_status(response: Any) -> int | None:
+    status = getattr(response, "status", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _response_url(response: Any, page: Page) -> str | None:
+    for candidate in (getattr(response, "url", None), getattr(page, "url", None)):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
 
 
 async def goto_page(
@@ -17,7 +46,7 @@ async def goto_page(
     *,
     timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
     fallback_commit: bool = True,
-) -> bool:
+) -> NavigationResult:
     """Navigate to a URL and wait for ``domcontentloaded``.
 
     With ``fallback_commit`` a timed-out page is retried with the lighter
@@ -29,8 +58,12 @@ async def goto_page(
     )
     for wait_until in waits:
         try:
-            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-            return True
+            response = await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            return NavigationResult(
+                True,
+                status=_response_status(response),
+                url=_response_url(response, page),
+            )
         except PlaywrightTimeoutError:
             if wait_until == waits[-1]:
                 print(
@@ -38,5 +71,5 @@ async def goto_page(
                     file=sys.stderr,
                     flush=True,
                 )
-                return False
-    return False
+                return NavigationResult(False)
+    return NavigationResult(False)

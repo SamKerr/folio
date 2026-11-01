@@ -24,7 +24,14 @@ from folio.capture import (
     prepare_data_page,
     prepare_page,
 )
-from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
+from folio.error_pages import (
+    DEFAULT_ERROR_RULES,
+    ErrorRules,
+    html_reason,
+    status_reason,
+    url_reason,
+)
+from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, NavigationResult, goto_page
 from folio.offline import DATA_MARKERS, extract_data_scripts, prepare_data_snapshot
 from folio.ordering import DEFAULT_CRAWL_ORDER, QueueKey, QueueOrdering
 from folio.storage import find_saved_page, read_text, sidecar_path, write_text_atomic
@@ -42,6 +49,8 @@ DEFAULT_LOGIN_MESSAGE = (
 )
 DEFAULT_ASSET_CONCURRENCY = 12
 DEFAULT_PAGE_CONCURRENCY = 20
+DEFAULT_RETRY_FAILED = 1
+DEFAULT_RETRY_DELAY_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,18 @@ class CrawlResult:
     """Wall time of the crawl phase (after the browser and login page are up)."""
     page_seconds: float = 0.0
     """Summed time spent fetching and saving new pages, across all tabs."""
+    pages_failed: int = 0
+    """URLs left unsaved after their last attempt (error pages, timeouts, failures);
+    a resumed crawl fetches them again."""
+
+
+@dataclass(frozen=True)
+class _CrawlCounts:
+    pages_saved: int
+    pages_skipped: int
+    crawl_seconds: float
+    page_seconds: float
+    pages_failed: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,6 +177,9 @@ async def run_crawl(
     wait_markers: tuple[str, ...] = (),
     marker_timeout_ms: int = 3000,
     order: str = DEFAULT_CRAWL_ORDER,
+    error_markers: tuple[str, ...] = (),
+    retry_failed: int = DEFAULT_RETRY_FAILED,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
@@ -181,8 +205,19 @@ async def run_crawl(
 
     ``order`` picks the crawl queue order (:class:`folio.ordering.QueueOrdering`):
     ``section`` (default), ``discovered`` or ``interleave``.
+
+    Error pages are never saved (:mod:`folio.error_pages`): a navigation answered
+    with HTTP >= 400, a final URL on an error path, or a page whose ``<title>`` /
+    ``__NEXT_DATA__.page`` marks an error (``error_markers`` extend the built-in
+    patterns). Any URL left unsaved is re-queued after the rest of the crawl, after
+    ``retry_delay`` seconds, up to ``retry_failed`` times, then counted in
+    ``CrawlResult.pages_failed``.
     """
     QueueOrdering(order)  # validate before launching a browser
+    if retry_failed < 0:
+        msg = "retry_failed must be >= 0"
+        raise ValueError(msg)
+    error_rules = ErrorRules.build(error_markers)
     if gzip_output and not data_only:
         msg = "gzip output is only supported for data-only crawls"
         raise ValueError(msg)
@@ -240,19 +275,22 @@ async def run_crawl(
                 gzip_output=gzip_output,
                 fast=fast,
                 order=order,
+                error_rules=error_rules,
+                retry_failed=retry_failed,
+                retry_delay=retry_delay,
                 verbose=verbose,
             )
         finally:
             await browser.close()
 
-    pages_saved, pages_skipped, crawl_seconds, page_seconds = counts
     return CrawlResult(
         start_url=root_url,
-        pages_saved=pages_saved,
-        pages_skipped=pages_skipped,
+        pages_saved=counts.pages_saved,
+        pages_skipped=counts.pages_skipped,
         output_dir=output_dir,
-        crawl_seconds=crawl_seconds,
-        page_seconds=page_seconds,
+        crawl_seconds=counts.crawl_seconds,
+        page_seconds=counts.page_seconds,
+        pages_failed=counts.pages_failed,
     )
 
 
@@ -285,8 +323,11 @@ async def _crawl_with_browser(
     gzip_output: bool = False,
     fast: FastDataOptions | None = None,
     order: str = DEFAULT_CRAWL_ORDER,
+    error_rules: ErrorRules = DEFAULT_ERROR_RULES,
+    retry_failed: int = DEFAULT_RETRY_FAILED,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
     verbose: bool,
-) -> tuple[int, int, float, float]:
+) -> _CrawlCounts:
     context = await browser.new_context(
         service_workers="block" if fast is not None else "allow"
     )
@@ -343,6 +384,9 @@ async def _crawl_with_browser(
             gzip_output=gzip_output,
             fast=fast,
             order=order,
+            error_rules=error_rules,
+            retry_failed=retry_failed,
+            retry_delay=retry_delay,
             verbose=verbose,
         )
     finally:
@@ -376,8 +420,11 @@ async def _crawl_pages_parallel(
     gzip_output: bool = False,
     fast: FastDataOptions | None = None,
     order: str = DEFAULT_CRAWL_ORDER,
+    error_rules: ErrorRules = DEFAULT_ERROR_RULES,
+    retry_failed: int = DEFAULT_RETRY_FAILED,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
     verbose: bool,
-) -> tuple[int, int, float, float]:
+) -> _CrawlCounts:
     queue: asyncio.PriorityQueue[tuple[QueueKey, str]] = asyncio.PriorityQueue()
     ordering = QueueOrdering(order)
 
@@ -404,6 +451,9 @@ async def _crawl_pages_parallel(
     in_flight = 0
     flight_lock = asyncio.Lock()
     page_seconds = 0.0
+    pages_failed = 0
+    attempts: dict[str, int] = {}
+    pending_retries: list[str] = []
     crawl_started = time.monotonic()
 
     async def should_stop() -> bool:
@@ -417,7 +467,54 @@ async def _crawl_pages_parallel(
 
     async def worker_done() -> bool:
         async with flight_lock:
-            return in_flight == 0 and queue.empty()
+            return in_flight == 0 and queue.empty() and (stop or not pending_retries)
+
+    async def record_failure(url: str) -> None:
+        """Hold a URL back for a retry round, or count it failed."""
+        nonlocal pages_failed
+        async with flight_lock:
+            attempts[url] = attempts.get(url, 0) + 1
+            if attempts[url] <= retry_failed:
+                pending_retries.append(url)
+                return
+            pages_failed += 1
+        if verbose:
+            print(
+                f"Failed (after {attempts[url]} attempt(s), left unsaved): {url}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def requeue_retries() -> bool:
+        """Once the queue has drained and no tab is busy, re-queue the held-back
+        failed URLs (after ``retry_delay``). True when it re-queued something."""
+        nonlocal in_flight
+        if await should_stop():
+            return False
+        async with flight_lock:
+            if in_flight or not queue.empty() or not pending_retries:
+                return False
+            batch = list(dict.fromkeys(pending_retries))
+            pending_retries.clear()
+            in_flight += 1  # keeps the other tabs from exiting while we wait
+        try:
+            if verbose:
+                print(
+                    f"Retrying {len(batch)} failed URL(s) in {retry_delay:g} s...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if retry_delay > 0:
+                await asyncio.sleep(retry_delay)
+            async with visited_lock:
+                visited.difference_update(batch)
+            for url in batch:
+                # Already passed the include / exclude filters on the first try.
+                await queue.put((ordering.key(url), url))
+        finally:
+            async with flight_lock:
+                in_flight -= 1
+        return True
 
     async def worker() -> None:
         nonlocal pages_saved, pages_skipped, in_flight, page_seconds
@@ -441,6 +538,8 @@ async def _crawl_pages_parallel(
                 try:
                     _, url = queue.get_nowait()
                 except asyncio.QueueEmpty:
+                    if await requeue_retries():
+                        continue
                     if await worker_done():
                         break
                     await asyncio.sleep(0.05)
@@ -515,8 +614,10 @@ async def _crawl_pages_parallel(
                             gzip_output=gzip_output,
                             asset_tracker=asset_tracker,
                             fast=fast,
+                            error_rules=error_rules,
                         )
                         if discovered is None:
+                            await record_failure(url)
                             continue
                         async with pages_lock:
                             pages_saved += 1
@@ -541,6 +642,7 @@ async def _crawl_pages_parallel(
                         file=sys.stderr,
                         flush=True,
                     )
+                    await record_failure(url)
                 finally:
                     async with flight_lock:
                         in_flight -= 1
@@ -549,7 +651,15 @@ async def _crawl_pages_parallel(
 
     workers = [asyncio.create_task(worker()) for _ in range(page_concurrency)]
     await asyncio.gather(*workers)
-    return pages_saved, pages_skipped, time.monotonic() - crawl_started, page_seconds
+    # Held back for a retry that a --max-pages stop never ran.
+    pages_failed += len(set(pending_retries))
+    return _CrawlCounts(
+        pages_saved=pages_saved,
+        pages_skipped=pages_skipped,
+        crawl_seconds=time.monotonic() - crawl_started,
+        page_seconds=page_seconds,
+        pages_failed=pages_failed,
+    )
 
 
 async def _save_page(
@@ -576,12 +686,20 @@ async def _save_page(
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
     fast: FastDataOptions | None = None,
+    error_rules: ErrorRules = DEFAULT_ERROR_RULES,
 ) -> list[str] | None:
-    """Fetch one page and return same-host links discovered on it."""
+    """Fetch one page and return same-host links discovered on it.
+
+    Returns ``None`` (and writes nothing) when the page did not load or is an error
+    page (see :mod:`folio.error_pages`), so a later run fetches it again.
+    """
     if fast is not None:
-        if not await goto_page(
+        nav = await goto_page(
             page, url, timeout_ms=navigation_timeout_ms, fallback_commit=False
-        ):
+        )
+        if not nav:
+            return None
+        if _skip_error(url, _navigation_reason(nav, error_rules)):
             return None
         await prepare_data_page(
             page,
@@ -591,7 +709,10 @@ async def _save_page(
         )
         raw_links = await extract_links(page)
     else:
-        if not await goto_page(page, url, timeout_ms=navigation_timeout_ms):
+        nav = await goto_page(page, url, timeout_ms=navigation_timeout_ms)
+        if not nav:
+            return None
+        if _skip_error(url, _navigation_reason(nav, error_rules)):
             return None
         raw_links = await discover_links_with_interaction(
             page,
@@ -614,6 +735,8 @@ async def _save_page(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if data_only:
         raw_html = await page.content()
+        if _skip_error(url, html_reason(raw_html, error_rules)):
+            return None
         sidecar = {"url": url, **extract_data_scripts(raw_html, markers=data_markers)}
         write_text_atomic(
             sidecar_path(out_path), json.dumps(sidecar, ensure_ascii=False)
@@ -627,6 +750,8 @@ async def _save_page(
     else:
         if data_sidecar:
             raw_html = await page.content()
+            if _skip_error(url, html_reason(raw_html, error_rules)):
+                return None
             sidecar = {"url": url, **extract_data_scripts(raw_html)}
             sidecar_path(out_path).write_text(
                 json.dumps(sidecar, ensure_ascii=False), encoding="utf-8"
@@ -648,6 +773,9 @@ async def _save_page(
             )
             return None
 
+        if _skip_error(url, html_reason(html, error_rules)):
+            sidecar_path(out_path).unlink(missing_ok=True)
+            return None
         out_path.write_text(html, encoding="utf-8")
         capture.clear()
 
@@ -664,6 +792,22 @@ async def _save_page(
         ):
             discovered.append(normalized)
     return discovered
+
+
+def _navigation_reason(nav: object, rules: ErrorRules) -> str | None:
+    """Why a loaded navigation is an error page: its HTTP status (primary) or a
+    final URL on an error path."""
+    if not isinstance(nav, NavigationResult):
+        return None  # a bare ``True`` (e.g. a stubbed navigation) carries no response
+    return status_reason(nav.status) or url_reason(nav.url, rules)
+
+
+def _skip_error(url: str, reason: str | None) -> bool:
+    """Log and report an error page; it is never saved."""
+    if reason is None:
+        return False
+    print(f"Skipped ({reason}): {url}", file=sys.stderr, flush=True)
+    return True
 
 
 def _default_login_prompt(message: str) -> None:

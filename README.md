@@ -88,6 +88,31 @@ and results pages keep flowing alongside them, instead of every results page bei
 first. **Data-only crawls default to `interleave`**; pass `--order section` to get the old
 order back.
 
+### Error pages
+
+A site's own error or challenge page is never saved as if it were the page asked for, so a
+resumed crawl (which skips any URL whose file exists) fetches it again. A page is an error page
+when its navigation answered **HTTP >= 400** (the primary check), when the final URL after
+redirects has an error path (`/otm-errors/`, `/error`, `/404`, `/500`, matched as whole path
+segments, so `/details/40412` is fine), or, as a fallback for sites that answer 200, when its
+`<title>` contains `Just a moment...`, `Access denied`, `Attention Required` or `captcha`
+(case-insensitive) or its Next.js `__NEXT_DATA__.page` is an error path. Such pages are logged
+as `Skipped (HTTP 500): <url>`, nothing is written, and they count as failed.
+`--error-marker PATTERN` (repeatable) adds a pattern: one starting with `/` is a path, anything
+else a title substring. Every URL left unsaved (error page, timeout, failure) is re-queued once
+at the end of the crawl, after `--retry-delay` seconds (default 5), because 500s are often
+transient; `--retry-failed N` sets the number of rounds (default 1, `0` disables). URLs that
+still fail are reported (`N page(s) failed`) and left for the next resume. To clean up error
+pages saved by an older version:
+
+```bash
+uv run folio slim output/www.example.com --drop-errors --dry-run   # list them
+uv run folio slim output/www.example.com --drop-errors             # delete page + sidecar
+```
+
+`--drop-errors` only deletes (it does not slim); it checks each saved page's `<title>` and
+`__NEXT_DATA__` (in the page or its sidecar, plain or `.gz`) and never touches `_assets`.
+
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
 ## Data-only crawls

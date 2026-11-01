@@ -9,8 +9,14 @@ from folio.capture import (
     DEFAULT_DATA_SETTLE_MS,
     DEFAULT_MARKER_TIMEOUT_MS,
 )
-from folio.crawler import CrawlResult, run_crawl
+from folio.crawler import (
+    DEFAULT_RETRY_DELAY_SECONDS,
+    DEFAULT_RETRY_FAILED,
+    CrawlResult,
+    run_crawl,
+)
 from folio.doctor import run_doctor
+from folio.error_pages import DEFAULT_ERROR_PATHS, DEFAULT_ERROR_TITLES
 from folio.offline import DATA_MARKERS
 from folio.ordering import (
     CRAWL_ORDERS,
@@ -244,6 +250,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --data-only: write <page>.html.gz and <page>.data.json.gz",
     )
+    _add_error_marker_argument(crawl_parser)
+    crawl_parser.add_argument(
+        "--retry-failed",
+        type=int,
+        default=DEFAULT_RETRY_FAILED,
+        metavar="N",
+        help=(
+            "Re-queue each URL that was not saved (error page, timeout, failure) up "
+            "to N times at the end of the crawl before counting it failed "
+            f"(default: {DEFAULT_RETRY_FAILED}; 0 disables)"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=DEFAULT_RETRY_DELAY_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait before each retry round "
+            f"(default: {DEFAULT_RETRY_DELAY_SECONDS:g})"
+        ),
+    )
     crawl_parser.add_argument(
         "--headless",
         action="store_true",
@@ -276,8 +304,37 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="Extra page-state marker for sidecar filtering (repeatable)",
     )
+    slim_parser.add_argument(
+        "--drop-errors",
+        action="store_true",
+        help=(
+            "Instead of slimming: delete saved error pages (title / __NEXT_DATA__ page "
+            "matching the error patterns) together with their sidecars"
+        ),
+    )
+    slim_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --drop-errors: list what would be deleted, delete nothing",
+    )
+    _add_error_marker_argument(slim_parser)
 
     return parser
+
+
+def _add_error_marker_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--error-marker",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Extra error-page pattern (repeatable): one starting with / is a URL path "
+            f"(whole segments; built in: {', '.join(DEFAULT_ERROR_PATHS)}), anything "
+            "else a <title> substring (case-insensitive; built in: "
+            f"{', '.join(DEFAULT_ERROR_TITLES)})"
+        ),
+    )
 
 
 def _format_bytes(count: int) -> str:
@@ -329,12 +386,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if command == "slim":
-        from folio.slim import slim_site
+        from folio.error_pages import ErrorRules
+        from folio.slim import drop_error_pages, slim_site
 
         directory: Path = args.directory
         if not directory.is_dir():
             print(f"Not a directory: {directory}", file=sys.stderr)
             return 1
+        if args.dry_run and not args.drop_errors:
+            print("--dry-run requires --drop-errors", file=sys.stderr)
+            return 1
+        if args.drop_errors:
+            drop = drop_error_pages(
+                directory,
+                rules=ErrorRules.build(args.error_marker),
+                dry_run=args.dry_run,
+            )
+            verb = "Would delete" if args.dry_run else "Deleted"
+            print(
+                f"{verb} {drop.error_pages} error page(s) of {drop.pages_checked} "
+                f"and {drop.orphan_sidecars} orphan error sidecar(s): "
+                f"{drop.files_deleted} file(s); {drop.failed} unreadable"
+            )
+            return 1 if drop.failed else 0
         stats = slim_site(
             directory, gzip_output=args.gzip, extra_markers=tuple(args.data_marker)
         )
@@ -351,6 +425,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "crawl":
         if args.gzip and not args.data_only:
             print("--gzip requires --data-only", file=sys.stderr)
+            return 1
+        if args.retry_failed < 0:
+            print("--retry-failed must be >= 0", file=sys.stderr)
             return 1
         fast = args.data_only and not args.full_render
         order = args.order or (
@@ -381,6 +458,9 @@ def main(argv: list[str] | None = None) -> int:
                     wait_markers=tuple(args.wait_for_marker),
                     marker_timeout_ms=args.marker_timeout_ms,
                     order=order,
+                    error_markers=tuple(args.error_marker),
+                    retry_failed=args.retry_failed,
+                    retry_delay=args.retry_delay,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,
@@ -407,6 +487,12 @@ def main(argv: list[str] | None = None) -> int:
             f"skipped {result.pages_skipped} existing, under "
             f"{result.output_dir.resolve()}"
         )
+        failed = result.pages_failed
+        if isinstance(failed, int) and failed > 0:
+            print(
+                f"{failed} page(s) failed (error pages, timeouts or errors) and were "
+                "left unsaved; a resumed crawl fetches them again"
+            )
         if args.stats:
             print(format_crawl_stats(result, args.concurrency))
         return 0
