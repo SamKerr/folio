@@ -179,3 +179,34 @@ def test_slim_command_rejects_missing_dir(
 ) -> None:
     assert main(["slim", str(tmp_path / "nope")]) == 1
     assert "Not a directory" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], "section"),
+        (["--data-only"], "interleave"),
+        (["--data-only", "--order", "section"], "section"),
+        (["--order", "discovered"], "discovered"),
+        (["--order", "interleave"], "interleave"),
+    ],
+)
+def test_crawl_passes_order(extra_args: list[str], expected: str) -> None:
+    from folio.crawler import CrawlResult
+
+    result = CrawlResult("https://a.com/x", 1, 0, Path("output"))
+    with patch(
+        "folio.cli.run_crawl", new_callable=AsyncMock, return_value=result
+    ) as mock_crawl:
+        code = main(["crawl", "https://a.com/x", "--skip-login-wait", *extra_args])
+    assert code == 0
+    assert mock_crawl.await_args is not None
+    assert mock_crawl.await_args.kwargs["order"] == expected
+
+
+def test_crawl_rejects_unknown_order(capsys: CaptureFixture[str]) -> None:
+    with patch("folio.cli.run_crawl", new_callable=AsyncMock) as mock_crawl:
+        with pytest.raises(SystemExit):
+            main(["crawl", "https://a.com/x", "--order", "random"])
+    mock_crawl.assert_not_called()
+    assert "invalid choice" in capsys.readouterr().err

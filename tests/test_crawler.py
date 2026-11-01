@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -210,9 +211,38 @@ async def test_run_crawl_waits_for_login_prompt(tmp_path: Path) -> None:
     prompt.assert_called_once()
 
 
+_SECTION_ORDER = [
+    "https://www.example.com/",
+    "https://www.example.com/learn/a",
+    "https://www.example.com/learn/c",
+    "https://www.example.com/code/b",
+    "https://www.example.com/code/d",
+]
+_DISCOVERY_ORDER = [
+    "https://www.example.com/",
+    "https://www.example.com/learn/a",
+    "https://www.example.com/code/b",
+    "https://www.example.com/learn/c",
+    "https://www.example.com/code/d",
+]
+
+
 @pytest.mark.asyncio
-async def test_run_crawl_finishes_path_section_before_next(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        (None, _SECTION_ORDER),
+        ("section", _SECTION_ORDER),
+        ("discovered", _DISCOVERY_ORDER),
+        ("interleave", _DISCOVERY_ORDER),
+    ],
+)
+async def test_run_crawl_finishes_path_section_before_next(
+    tmp_path: Path, order: str | None, expected: list[str]
+) -> None:
     root_url = "https://www.example.com/"
+    # order=None exercises run_crawl's default.
+    extra: dict[str, Any] = {} if order is None else {"order": order}
     page_links: dict[str, list[str]] = {
         root_url: [
             "https://www.example.com/learn/a",
@@ -281,16 +311,11 @@ async def test_run_crawl_finishes_path_section_before_next(tmp_path: Path) -> No
             max_pages=10,
             page_concurrency=1,
             resume=False,
+            **extra,
         )
 
     assert result.pages_saved == 5
-    assert crawl_order[-5:] == [
-        root_url,
-        "https://www.example.com/learn/a",
-        "https://www.example.com/learn/c",
-        "https://www.example.com/code/b",
-        "https://www.example.com/code/d",
-    ]
+    assert crawl_order[-5:] == expected
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from folio.capture import (
 )
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, goto_page
 from folio.offline import DATA_MARKERS, extract_data_scripts, prepare_data_snapshot
+from folio.ordering import DEFAULT_CRAWL_ORDER, QueueKey, QueueOrdering
 from folio.storage import find_saved_page, read_text, sidecar_path, write_text_atomic
 from folio.urls import (
     is_excluded_url,
@@ -33,8 +34,6 @@ from folio.urls import (
     normalize_url,
     output_path_to_url,
     same_host,
-    url_path_depth,
-    url_path_section,
     url_to_output_path,
 )
 
@@ -156,6 +155,7 @@ async def run_crawl(
     allow_hosts: tuple[str, ...] = (),
     wait_markers: tuple[str, ...] = (),
     marker_timeout_ms: int = 3000,
+    order: str = DEFAULT_CRAWL_ORDER,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
@@ -178,7 +178,11 @@ async def run_crawl(
     waits each page waits for ``domcontentloaded`` (no ``commit`` fallback), a
     page-state marker in a ``<script>`` (``wait_markers``, default the sidecar
     markers; at most ``marker_timeout_ms``) and ``settle_ms``.
+
+    ``order`` picks the crawl queue order (:class:`folio.ordering.QueueOrdering`):
+    ``section`` (default), ``discovered`` or ``interleave``.
     """
+    QueueOrdering(order)  # validate before launching a browser
     if gzip_output and not data_only:
         msg = "gzip output is only supported for data-only crawls"
         raise ValueError(msg)
@@ -235,6 +239,7 @@ async def run_crawl(
                 data_markers=markers,
                 gzip_output=gzip_output,
                 fast=fast,
+                order=order,
                 verbose=verbose,
             )
         finally:
@@ -279,6 +284,7 @@ async def _crawl_with_browser(
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
     fast: FastDataOptions | None = None,
+    order: str = DEFAULT_CRAWL_ORDER,
     verbose: bool,
 ) -> tuple[int, int, float, float]:
     context = await browser.new_context(
@@ -336,6 +342,7 @@ async def _crawl_with_browser(
             data_markers=data_markers,
             gzip_output=gzip_output,
             fast=fast,
+            order=order,
             verbose=verbose,
         )
     finally:
@@ -368,30 +375,20 @@ async def _crawl_pages_parallel(
     data_markers: tuple[str, ...] = DATA_MARKERS,
     gzip_output: bool = False,
     fast: FastDataOptions | None = None,
+    order: str = DEFAULT_CRAWL_ORDER,
     verbose: bool,
 ) -> tuple[int, int, float, float]:
-    queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
-    section_ranks: dict[str, int] = {"": 0}
-    section_lock = asyncio.Lock()
-    enqueue_counter = 0
-    enqueue_lock = asyncio.Lock()
+    queue: asyncio.PriorityQueue[tuple[QueueKey, str]] = asyncio.PriorityQueue()
+    ordering = QueueOrdering(order)
 
     async def enqueue_url(url: str, *, seed: bool = False) -> None:
-        nonlocal enqueue_counter
         if is_excluded_url(url, exclude_patterns):
             return
         if not seed and not is_included_url(url, include_patterns):
             return
-        section = url_path_section(url)
-        async with section_lock:
-            if section not in section_ranks:
-                section_ranks[section] = len(section_ranks)
-            section_rank = section_ranks[section]
-        depth = url_path_depth(url)
-        async with enqueue_lock:
-            enqueue_counter += 1
-            order = enqueue_counter
-        await queue.put((section_rank, depth, order, url))
+        # Synchronous, so atomic within the event loop.
+        key = ordering.key(url, seed=seed)
+        await queue.put((key, url))
 
     await enqueue_url(root_url, seed=True)
     for seed_url in extra_start_urls:
@@ -442,7 +439,7 @@ async def _crawl_pages_parallel(
                     break
 
                 try:
-                    _, _, _, url = queue.get_nowait()
+                    _, url = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     if await worker_done():
                         break

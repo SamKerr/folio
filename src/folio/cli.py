@@ -12,6 +12,11 @@ from folio.capture import (
 from folio.crawler import CrawlResult, run_crawl
 from folio.doctor import run_doctor
 from folio.offline import DATA_MARKERS
+from folio.ordering import (
+    CRAWL_ORDERS,
+    DEFAULT_CRAWL_ORDER,
+    DEFAULT_DATA_ONLY_CRAWL_ORDER,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -208,6 +213,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl_parser.add_argument(
+        "--order",
+        choices=CRAWL_ORDERS,
+        default=None,
+        help=(
+            "Crawl queue order: 'section' fetches every URL of the first path section "
+            "seen before the next section; 'discovered' is plain breadth-first; "
+            "'interleave' round-robins across sections so e.g. listing pages arrive "
+            "while results pages are still being fetched (default: section; "
+            "interleave with --data-only)"
+        ),
+    )
+    crawl_parser.add_argument(
         "--stats",
         action="store_true",
         help="Print pages per minute and seconds per page at the end",
@@ -336,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
             print("--gzip requires --data-only", file=sys.stderr)
             return 1
         fast = args.data_only and not args.full_render
+        order = args.order or (
+            DEFAULT_DATA_ONLY_CRAWL_ORDER if args.data_only else DEFAULT_CRAWL_ORDER
+        )
         settle_ms = args.settle_ms
         if settle_ms is None:
             settle_ms = DEFAULT_DATA_SETTLE_MS if fast else 1000
@@ -360,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                     allow_hosts=tuple(args.allow_host),
                     wait_markers=tuple(args.wait_for_marker),
                     marker_timeout_ms=args.marker_timeout_ms,
+                    order=order,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,

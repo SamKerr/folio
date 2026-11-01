@@ -75,6 +75,19 @@ uv run folio crawl "https://www.example.com/search?area=leeds" \
   `window.PAGE_MODEL = {...}` — to `<page>.data.json`, so another program can parse the
   listing data offline while the HTML stays script-free.
 
+### Crawl order
+
+`--order` picks which queued page is fetched next. `section` (the default) fetches every URL
+of the first path section seen before any URL of a later one (shallower paths first), so a
+site's `/docs/...` mirror completes section by section. `discovered` is plain breadth-first,
+in the order links were found. `interleave` round-robins across path sections: the first
+queued URL of every section, then the second of every section, and so on (a URL found again
+keeps its place; start URLs always go first). On a listings portal this means listing pages
+(`/details/...`) start as soon as the first results page (`/for-sale/...`) has yielded links,
+and results pages keep flowing alongside them, instead of every results page being fetched
+first. **Data-only crawls default to `interleave`**; pass `--order section` to get the old
+order back.
+
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
 ## Data-only crawls
