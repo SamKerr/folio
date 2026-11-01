@@ -23,6 +23,11 @@ from folio.ordering import (
     DEFAULT_CRAWL_ORDER,
     DEFAULT_DATA_ONLY_CRAWL_ORDER,
 )
+from folio.rate_limit import (
+    DEFAULT_ADAPTIVE_STEP_SECONDS,
+    DEFAULT_BACKOFF_SECONDS,
+    DEFAULT_MAX_BACKOFF_SECONDS,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -273,6 +278,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl_parser.add_argument(
+        "--backoff",
+        type=float,
+        default=DEFAULT_BACKOFF_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "On HTTP 429 (or 503 with Retry-After) without a Retry-After header, pause "
+            "all tabs this long, doubling per consecutive rate-limited pause "
+            f"(default: {DEFAULT_BACKOFF_SECONDS:g})"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--max-backoff",
+        type=float,
+        default=DEFAULT_MAX_BACKOFF_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Longest rate-limit pause, also capping Retry-After "
+            f"(default: {DEFAULT_MAX_BACKOFF_SECONDS:g})"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "After each rate-limit pause, add --adaptive-step seconds to the per-page "
+            "delay for the rest of the run (default: on with --data-only)"
+        ),
+    )
+    crawl_parser.add_argument(
+        "--adaptive-step",
+        type=float,
+        default=DEFAULT_ADAPTIVE_STEP_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Seconds added to the per-page delay per rate-limit pause with --adaptive "
+            f"(default: {DEFAULT_ADAPTIVE_STEP_SECONDS:g})"
+        ),
+    )
+    crawl_parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser headless (not recommended when login is required)",
@@ -350,13 +395,17 @@ def format_crawl_stats(result: CrawlResult, concurrency: int) -> str:
     """One line of crawl throughput: pages / minute and seconds per page."""
     pages = result.pages_saved
     seconds = result.crawl_seconds
+    pacing = (
+        f"; final delay {result.final_delay:g} s/page, "
+        f"{result.rate_limit_pauses} rate-limit pause(s)"
+    )
     if pages <= 0 or seconds <= 0:
-        return f"Stats: {pages} new page(s) in {seconds:.1f} s"
+        return f"Stats: {pages} new page(s) in {seconds:.1f} s{pacing}"
     return (
         f"Stats: {pages} new page(s) in {seconds:.1f} s: "
         f"{pages * 60 / seconds:.1f} pages/min, {seconds / pages:.2f} s/page wall, "
         f"{result.page_seconds / pages:.2f} s/page per tab "
-        f"(concurrency {concurrency})"
+        f"(concurrency {concurrency}){pacing}"
     )
 
 
@@ -429,6 +478,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.retry_failed < 0:
             print("--retry-failed must be >= 0", file=sys.stderr)
             return 1
+        for flag, value in (
+            ("--backoff", args.backoff),
+            ("--max-backoff", args.max_backoff),
+            ("--adaptive-step", args.adaptive_step),
+        ):
+            if value < 0:
+                print(f"{flag} must be >= 0", file=sys.stderr)
+                return 1
         fast = args.data_only and not args.full_render
         order = args.order or (
             DEFAULT_DATA_ONLY_CRAWL_ORDER if args.data_only else DEFAULT_CRAWL_ORDER
@@ -461,6 +518,10 @@ def main(argv: list[str] | None = None) -> int:
                     error_markers=tuple(args.error_marker),
                     retry_failed=args.retry_failed,
                     retry_delay=args.retry_delay,
+                    backoff=args.backoff,
+                    max_backoff=args.max_backoff,
+                    adaptive=args.adaptive,
+                    adaptive_step=args.adaptive_step,
                     headed=not args.headless,
                     skip_login_wait=args.skip_login_wait,
                     delay_seconds=args.delay,

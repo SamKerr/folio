@@ -34,6 +34,14 @@ from folio.error_pages import (
 from folio.navigation import DEFAULT_NAVIGATION_TIMEOUT_MS, NavigationResult, goto_page
 from folio.offline import DATA_MARKERS, extract_data_scripts, prepare_data_snapshot
 from folio.ordering import DEFAULT_CRAWL_ORDER, QueueKey, QueueOrdering
+from folio.rate_limit import (
+    DEFAULT_ADAPTIVE_STEP_SECONDS,
+    DEFAULT_BACKOFF_SECONDS,
+    DEFAULT_MAX_BACKOFF_SECONDS,
+    RateLimitedError,
+    backoff_seconds,
+    is_rate_limited,
+)
 from folio.storage import find_saved_page, read_text, sidecar_path, write_text_atomic
 from folio.urls import (
     is_excluded_url,
@@ -66,6 +74,11 @@ class CrawlResult:
     pages_failed: int = 0
     """URLs left unsaved after their last attempt (error pages, timeouts, failures);
     a resumed crawl fetches them again."""
+    final_delay: float = 0.0
+    """Per-page delay at the end of the crawl (``delay_seconds`` plus any adaptive
+    increases after rate-limit cool-downs)."""
+    rate_limit_pauses: int = 0
+    """Cool-downs started because the site answered HTTP 429 / 503 + Retry-After."""
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,18 @@ class _CrawlCounts:
     crawl_seconds: float
     page_seconds: float
     pages_failed: int = 0
+    final_delay: float = 0.0
+    rate_limit_pauses: int = 0
+
+
+@dataclass(frozen=True)
+class RateLimitOptions:
+    """Cool-down settings for HTTP 429 / 503 + Retry-After (:mod:`folio.rate_limit`)."""
+
+    backoff: float = DEFAULT_BACKOFF_SECONDS
+    max_backoff: float = DEFAULT_MAX_BACKOFF_SECONDS
+    adaptive: bool = False
+    adaptive_step: float = DEFAULT_ADAPTIVE_STEP_SECONDS
 
 
 @dataclass(frozen=True)
@@ -180,6 +205,10 @@ async def run_crawl(
     error_markers: tuple[str, ...] = (),
     retry_failed: int = DEFAULT_RETRY_FAILED,
     retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+    backoff: float = DEFAULT_BACKOFF_SECONDS,
+    max_backoff: float = DEFAULT_MAX_BACKOFF_SECONDS,
+    adaptive: bool | None = None,
+    adaptive_step: float = DEFAULT_ADAPTIVE_STEP_SECONDS,
     verbose: bool = True,
 ) -> CrawlResult:
     """Open start_url, wait for optional login confirmation, then crawl.
@@ -212,11 +241,32 @@ async def run_crawl(
     patterns). Any URL left unsaved is re-queued after the rest of the crawl, after
     ``retry_delay`` seconds, up to ``retry_failed`` times, then counted in
     ``CrawlResult.pages_failed``.
+
+    Rate limits: a page answered HTTP 429 (or 503 with ``Retry-After``) pauses every
+    tab for ``Retry-After`` seconds, else ``backoff`` doubling per consecutive
+    cool-down, at most ``max_backoff``; a saved page resets the doubling. The URL is
+    put back on the queue (up to ``retry_failed`` times, then counted failed). With
+    ``adaptive`` (default: on for ``data_only``) each cool-down adds
+    ``adaptive_step`` seconds to the per-page delay for the rest of the run.
     """
     QueueOrdering(order)  # validate before launching a browser
     if retry_failed < 0:
         msg = "retry_failed must be >= 0"
         raise ValueError(msg)
+    for name, value in (
+        ("backoff", backoff),
+        ("max_backoff", max_backoff),
+        ("adaptive_step", adaptive_step),
+    ):
+        if value < 0:
+            msg = f"{name} must be >= 0"
+            raise ValueError(msg)
+    rate_limit = RateLimitOptions(
+        backoff=backoff,
+        max_backoff=max_backoff,
+        adaptive=data_only if adaptive is None else adaptive,
+        adaptive_step=adaptive_step,
+    )
     error_rules = ErrorRules.build(error_markers)
     if gzip_output and not data_only:
         msg = "gzip output is only supported for data-only crawls"
@@ -278,6 +328,7 @@ async def run_crawl(
                 error_rules=error_rules,
                 retry_failed=retry_failed,
                 retry_delay=retry_delay,
+                rate_limit=rate_limit,
                 verbose=verbose,
             )
         finally:
@@ -291,6 +342,8 @@ async def run_crawl(
         crawl_seconds=counts.crawl_seconds,
         page_seconds=counts.page_seconds,
         pages_failed=counts.pages_failed,
+        final_delay=counts.final_delay,
+        rate_limit_pauses=counts.rate_limit_pauses,
     )
 
 
@@ -326,6 +379,7 @@ async def _crawl_with_browser(
     error_rules: ErrorRules = DEFAULT_ERROR_RULES,
     retry_failed: int = DEFAULT_RETRY_FAILED,
     retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+    rate_limit: RateLimitOptions | None = None,
     verbose: bool,
 ) -> _CrawlCounts:
     context = await browser.new_context(
@@ -387,6 +441,7 @@ async def _crawl_with_browser(
             error_rules=error_rules,
             retry_failed=retry_failed,
             retry_delay=retry_delay,
+            rate_limit=rate_limit,
             verbose=verbose,
         )
     finally:
@@ -423,6 +478,7 @@ async def _crawl_pages_parallel(
     error_rules: ErrorRules = DEFAULT_ERROR_RULES,
     retry_failed: int = DEFAULT_RETRY_FAILED,
     retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+    rate_limit: RateLimitOptions | None = None,
     verbose: bool,
 ) -> _CrawlCounts:
     queue: asyncio.PriorityQueue[tuple[QueueKey, str]] = asyncio.PriorityQueue()
@@ -455,6 +511,13 @@ async def _crawl_pages_parallel(
     attempts: dict[str, int] = {}
     pending_retries: list[str] = []
     crawl_started = time.monotonic()
+    limits = rate_limit or RateLimitOptions()
+    page_delay = max(0.0, delay_seconds)
+    gate = asyncio.Event()  # set = open; cleared during a rate-limit cool-down
+    gate.set()
+    consecutive_limits = 0
+    rate_limit_pauses = 0
+    rate_attempts: dict[str, int] = {}
 
     async def should_stop() -> bool:
         async with stop_lock:
@@ -516,8 +579,59 @@ async def _crawl_pages_parallel(
                 in_flight -= 1
         return True
 
+    async def handle_rate_limit(exc: RateLimitedError) -> None:
+        """Put the URL back on the queue and, unless a cool-down is already running
+        (a request that was in flight when it began), pause every tab."""
+        nonlocal pages_failed, consecutive_limits, rate_limit_pauses, page_delay
+        url = exc.url
+        async with flight_lock:
+            rate_attempts[url] = rate_attempts.get(url, 0) + 1
+            requeue = rate_attempts[url] <= retry_failed
+            if not requeue:
+                pages_failed += 1
+        if requeue:
+            async with visited_lock:
+                visited.discard(url)
+            await queue.put((ordering.key(url), url))
+        elif verbose:
+            print(
+                f"Failed (rate limited {rate_attempts[url]} time(s), left unsaved): "
+                f"{url}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not gate.is_set():
+            return
+        consecutive_limits += 1
+        rate_limit_pauses += 1
+        pause = backoff_seconds(
+            consecutive_limits,
+            exc.retry_after,
+            base=limits.backoff,
+            cap=limits.max_backoff,
+        )
+        if limits.adaptive:
+            page_delay += limits.adaptive_step
+        print(
+            f"Rate limited (HTTP {exc.status}): pausing {pause:g} s",
+            file=sys.stderr,
+            flush=True,
+        )
+        gate.clear()
+        try:
+            await asyncio.sleep(pause)
+        finally:
+            gate.set()
+        if limits.adaptive and verbose:
+            print(
+                f"Resuming with {page_delay:g} s between pages",
+                file=sys.stderr,
+                flush=True,
+            )
+
     async def worker() -> None:
         nonlocal pages_saved, pages_skipped, in_flight, page_seconds
+        nonlocal consecutive_limits
         page = await context.new_page()
         capture = NetworkCapture()
         asset_tracker = AssetQuietTracker()
@@ -582,6 +696,7 @@ async def _crawl_pages_parallel(
                         async with pages_lock:
                             pages_skipped += 1
                     else:
+                        await gate.wait()  # hold during a rate-limit cool-down
                         if verbose:
                             async with pages_lock:
                                 label_num = pages_saved + 1
@@ -622,11 +737,12 @@ async def _crawl_pages_parallel(
                         async with pages_lock:
                             pages_saved += 1
                             page_seconds += time.monotonic() - page_started
+                            consecutive_limits = 0  # the site accepts us again
                             if max_pages is not None and pages_saved >= max_pages:
                                 await set_stop()
 
-                        if delay_seconds > 0:
-                            await asyncio.sleep(delay_seconds)
+                        if page_delay > 0:
+                            await asyncio.sleep(page_delay)
 
                     if await should_stop():
                         continue
@@ -636,6 +752,8 @@ async def _crawl_pages_parallel(
                             if link in visited or await should_stop():
                                 continue
                         await enqueue_url(link)
+                except RateLimitedError as exc:
+                    await handle_rate_limit(exc)
                 except Exception as exc:
                     print(
                         f"Warning: failed to process {url}: {exc}",
@@ -659,6 +777,8 @@ async def _crawl_pages_parallel(
         crawl_seconds=time.monotonic() - crawl_started,
         page_seconds=page_seconds,
         pages_failed=pages_failed,
+        final_delay=page_delay,
+        rate_limit_pauses=rate_limit_pauses,
     )
 
 
@@ -691,7 +811,9 @@ async def _save_page(
     """Fetch one page and return same-host links discovered on it.
 
     Returns ``None`` (and writes nothing) when the page did not load or is an error
-    page (see :mod:`folio.error_pages`), so a later run fetches it again.
+    page (see :mod:`folio.error_pages`), so a later run fetches it again. Raises
+    :class:`folio.rate_limit.RateLimitedError` (writing nothing) on HTTP 429, or 503
+    with ``Retry-After``.
     """
     if fast is not None:
         nav = await goto_page(
@@ -699,6 +821,7 @@ async def _save_page(
         )
         if not nav:
             return None
+        _raise_if_rate_limited(url, nav)
         if _skip_error(url, _navigation_reason(nav, error_rules)):
             return None
         await prepare_data_page(
@@ -712,6 +835,7 @@ async def _save_page(
         nav = await goto_page(page, url, timeout_ms=navigation_timeout_ms)
         if not nav:
             return None
+        _raise_if_rate_limited(url, nav)
         if _skip_error(url, _navigation_reason(nav, error_rules)):
             return None
         raw_links = await discover_links_with_interaction(
@@ -800,6 +924,14 @@ def _navigation_reason(nav: object, rules: ErrorRules) -> str | None:
     if not isinstance(nav, NavigationResult):
         return None  # a bare ``True`` (e.g. a stubbed navigation) carries no response
     return status_reason(nav.status) or url_reason(nav.url, rules)
+
+
+def _raise_if_rate_limited(url: str, nav: object) -> None:
+    if isinstance(nav, NavigationResult) and is_rate_limited(
+        nav.status, nav.retry_after
+    ):
+        assert nav.status is not None
+        raise RateLimitedError(url, nav.status, nav.retry_after)
 
 
 def _skip_error(url: str, reason: str | None) -> bool:

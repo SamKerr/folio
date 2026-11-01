@@ -9,6 +9,8 @@ from typing import Any, Literal
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from folio.rate_limit import parse_retry_after
+
 DEFAULT_NAVIGATION_TIMEOUT_MS = 60_000
 
 
@@ -17,12 +19,14 @@ class NavigationResult:
     """Outcome of :func:`goto_page`; truthy when the page loaded.
 
     ``status`` / ``url`` are the final (post-redirect) response's HTTP status and
-    URL, when Playwright returned a response.
+    URL, when Playwright returned a response; ``retry_after`` is its ``Retry-After``
+    header in seconds, when present and parseable.
     """
 
     ok: bool
     status: int | None = None
     url: str | None = None
+    retry_after: float | None = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -31,6 +35,16 @@ class NavigationResult:
 def _response_status(response: Any) -> int | None:
     status = getattr(response, "status", None)
     return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _response_retry_after(response: Any) -> float | None:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, dict):
+        return None
+    for name, value in headers.items():
+        if isinstance(name, str) and name.lower() == "retry-after":
+            return parse_retry_after(value if isinstance(value, str) else None)
+    return None
 
 
 def _response_url(response: Any, page: Page) -> str | None:
@@ -63,6 +77,7 @@ async def goto_page(
                 True,
                 status=_response_status(response),
                 url=_response_url(response, page),
+                retry_after=_response_retry_after(response),
             )
         except PlaywrightTimeoutError:
             if wait_until == waits[-1]:

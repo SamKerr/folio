@@ -113,6 +113,21 @@ uv run folio slim output/www.example.com --drop-errors             # delete page
 `--drop-errors` only deletes (it does not slim); it checks each saved page's `<title>` and
 `__NEXT_DATA__` (in the page or its sidecar, plain or `.gz`) and never touches `_assets`.
 
+### Rate limits
+
+When the site answers **HTTP 429** (or **503 with a `Retry-After` header**) the crawl cools
+down: every tab pauses for `Retry-After` seconds when the header is present, otherwise for
+`--backoff` seconds (default 30) doubling with each consecutive rate-limited pause, never
+longer than `--max-backoff` (default 300, which also caps `Retry-After`). It logs
+`Rate limited (HTTP 429): pausing N s` once per pause. The URL goes straight back on the queue
+and is fetched again after the pause, up to `--retry-failed` times before it counts as failed;
+a saved page resets the doubling. A 503 without `Retry-After` stays an ordinary error page.
+With `--adaptive` (**on by default in `--data-only` crawls**; `--no-adaptive` turns it off)
+each pause also adds `--adaptive-step` seconds (default 1) to the per-page `--delay` for the
+rest of the run, so a crawl settles at a rate the site accepts; `--stats` prints the final
+delay and the number of pauses. The cool-down covers one crawl's tabs only: separate crawls
+against the same site do not see each other's pauses.
+
 `uv run folio crawl --help` for waits, limits, headless mode, and the rest.
 
 ## Data-only crawls
